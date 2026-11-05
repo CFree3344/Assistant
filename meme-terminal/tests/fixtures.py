@@ -58,6 +58,8 @@ def dex_pair(
     name: str = "Good Boy",
     liquidity: float = 20_000,
     volume: float = 15_000,
+    market_cap: float = 120_000,
+    dex_id: str = "pumpswap",
     buys: int = 80,
     sells: int = 70,
     age: timedelta = timedelta(hours=2),
@@ -66,7 +68,8 @@ def dex_pair(
     created = int((NOW - age).timestamp() * 1000)
     pair = {
         "chainId": "solana",
-        "dexId": "pumpswap",
+        "dexId": dex_id,
+        "marketCap": market_cap,
         "pairAddress": PAIR,
         "baseToken": {"address": mint, "name": name, "symbol": symbol},
         "quoteToken": {"address": WSOL_MINT, "name": "Wrapped SOL", "symbol": "SOL"},

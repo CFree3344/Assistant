@@ -276,6 +276,49 @@ def test_fork_shell_and_missing_repo_fail():
     assert not _by_name(result)["github_if_product"].passed
 
 
+def test_pump_graduation_waits_an_hour_and_ignores_other_dexes():
+    fresh = passing_raw(dex_pairs=[dex_pair(age=timedelta(minutes=30))])
+    result = evaluate(fresh, now=NOW)
+    assert _by_name(result)["min_age"].passed
+    assert not _by_name(result)["minutes_since_graduation"].passed
+    assert "waiting until 60" in _by_name(result)["minutes_since_graduation"].reason
+
+    aged = evaluate(passing_raw(), now=NOW)
+    assert _by_name(aged)["minutes_since_graduation"].passed
+
+    plain = rug_report()
+    for market in plain["markets"]:
+        market["marketType"] = "raydium"
+    other = passing_raw(
+        dex_pairs=[dex_pair(dex_id="raydium", age=timedelta(minutes=30))],
+        rug_report=plain,
+    )
+    result = evaluate(other, now=NOW)
+    assert _by_name(result)["minutes_since_graduation"].passed
+    assert "not a pump.fun" in _by_name(result)["minutes_since_graduation"].reason
+
+    curve = passing_raw(dex_pairs=[dex_pair(dex_id="pumpfun", age=timedelta(hours=3))])
+    result = evaluate(curve, now=NOW)
+    assert "bonding curve" in _by_name(result)["minutes_since_graduation"].reason
+
+
+def test_linked_early_buyers_use_only_an_explicit_field():
+    untouched = evaluate(passing_raw(), now=NOW)
+    assert _by_name(untouched)["linked_early_buyers"].passed
+    assert _by_name(untouched)["linked_early_buyers"].evidence.get("applied") is False
+
+    hot = rug_report()
+    hot["linkedEarlyBuyersPct"] = 30
+    result = evaluate(passing_raw(rug_report=hot), now=NOW)
+    assert not _by_name(result)["linked_early_buyers"].passed
+
+    fine = rug_report()
+    fine["linkedEarlyBuyersPct"] = 10
+    result = evaluate(passing_raw(rug_report=fine), now=NOW)
+    assert _by_name(result)["linked_early_buyers"].passed
+    assert _by_name(result)["linked_early_buyers"].evidence["applied"] is True
+
+
 def test_dex_outage_fails_closed():
     raw = passing_raw(dex_pairs=None)
     result = evaluate(raw, now=NOW)

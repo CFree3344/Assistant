@@ -125,9 +125,11 @@ def render_daily(bundle: dict[str, Any], rules: Rules = RULES) -> str:
     lines.append(
         f"Bankroll ${rules.paper_bankroll_usd:,.0f} (live-equivalent book ${rules.live_equivalent_bankroll_usd:,.0f}). "
         f"Position ${rules.position_size_usd:,.0f} inside ${rules.position_size_min_usd:,.0f}–${rules.position_size_max_usd:,.0f}. "
-        f"Max {rules.max_open_positions} open. Stop {rules.stop_loss_pct:.0%}. "
-        f"Sell half at {rules.take_profit_multiple:.0f}x, then trail {rules.trail_drop_from_peak:.0%} off the observed peak. "
-        f"Halt at ${rules.halt_equity_usd:,.0f}. Fee ${rules.flat_fee_usd:.2f} per fill."
+        f"Max {rules.max_open_positions} open. Stop {rules.stop_loss_pct:.0%} with a {rules.stop_gap_extra_pct:.0%} modeled gap. "
+        f"Sell half at {rules.take_profit_multiple:g}x, then trail {rules.trail_drop_from_peak:.0%} off the observed peak. "
+        f"Max hold {rules.max_hold_minutes} minutes. "
+        f"Paper halt ${rules.halt_equity_usd:,.0f} (live halt ${rules.live_halt_equity_usd:,.0f} on the ${rules.live_equivalent_bankroll_usd:,.0f} book). "
+        f"Fee ${rules.flat_fee_usd:.2f} per fill. Copy signals do not open trades."
     )
     lines.append("")
     return "\n".join(lines)
@@ -176,7 +178,20 @@ def render_scorecard(bundle: dict[str, Any], rules: Rules = RULES) -> str:
         "",
         "Win rate and expectancy use closed trades only. The go/no-go net also marks open positions at the bid, after modeled exit slippage, and every fill has already paid the flat fee.",
         "",
+        "## Calls by market-cap bucket",
+        "",
     ]
+    buckets = bundle.get("mcap_buckets") or []
+    if not buckets:
+        lines.append("No calls yet.")
+    else:
+        lines.append("| Bucket | Calls |")
+        lines.append("| --- | ---: |")
+        for row in buckets:
+            lines.append(f"| {_cell(row['bucket'])} | {int(row['n'])} |")
+        lines.append("")
+        lines.append("50–250k is recorded as its own bucket. It does not get a separate auto-buy rule.")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -268,6 +283,14 @@ def load_scorecard(store: Store) -> dict[str, Any]:
     latest = store.query(
         "SELECT equity_usd FROM equity_snapshots ORDER BY snapshot_at DESC, rowid DESC LIMIT 1"
     )
+    buckets = store.query(
+        """
+        SELECT COALESCE(NULLIF(mcap_bucket, ''), 'unknown') AS bucket, COUNT(*) AS n
+        FROM paper_trades
+        GROUP BY 1
+        ORDER BY 1
+        """
+    )
     equity = latest[0]["equity_usd"] if latest else None
     return {
         "calls": int(calls[0]["n"]) if calls else 0,
@@ -276,6 +299,7 @@ def load_scorecard(store: Store) -> dict[str, Any]:
         "fees": float(fees[0]["n"] or 0) if fees else 0.0,
         "equity_curve": [float(row["equity_usd"]) for row in curve],
         "equity": None if equity is None else float(equity),
+        "mcap_buckets": buckets,
     }
 
 
@@ -283,12 +307,12 @@ def _trade_table(rows: list[dict[str, Any]]) -> list[str]:
     if not rows:
         return ["No trades closed today."]
     lines = [
-        "| Symbol | Mint | Entry | Realized P&L | Fees | Exit |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
+        "| Symbol | Mint | Mcap bucket | Entry | Realized P&L | Fees | Exit |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
         lines.append(
-            f"| {_cell(row.get('symbol'))} | `{row['mint']}` | {_px(row['entry_fill'])} | "
+            f"| {_cell(row.get('symbol'))} | `{row['mint']}` | {_bucket(row)} | {_px(row['entry_fill'])} | "
             f"{_signed(row['realized_pnl_usd'])} | {_money(row['fees_usd'])} | {_cell(row.get('exit_reason'))} |"
         )
     return lines
@@ -298,12 +322,12 @@ def _open_table(rows: list[dict[str, Any]]) -> list[str]:
     if not rows:
         return ["No open paper positions."]
     lines = [
-        "| Symbol | Mint | Qty left | Entry fill | Last mid | Peak mid | Half sold | Fees so far | Realized so far |",
-        "| --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
+        "| Symbol | Mint | Mcap bucket | Qty left | Entry fill | Last mid | Peak mid | Half sold | Fees so far | Realized so far |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            f"| {_cell(row.get('symbol'))} | `{row['mint']}` | {row['remaining_qty']:.4f} | "
+            f"| {_cell(row.get('symbol'))} | `{row['mint']}` | {_bucket(row)} | {row['remaining_qty']:.4f} | "
             f"{_px(row['entry_fill'])} | {_px(row['last_mid'])} | {_px(row['peak_mid'])} | "
             f"{'yes' if row['half_sold'] else 'no'} | {_money(row['fees_usd'])} | {_signed(row['realized_pnl_usd'])} |"
         )
@@ -346,6 +370,10 @@ def _mean(values: list[Any]) -> float | None:
     if not nums:
         return None
     return sum(nums) / len(nums)
+
+
+def _bucket(row: dict[str, Any]) -> str:
+    return str(row.get("mcap_bucket") or "unknown")
 
 
 def _cell(value: Any) -> str:

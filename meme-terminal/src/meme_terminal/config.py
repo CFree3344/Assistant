@@ -3,13 +3,16 @@
 Every threshold the checklist and the simulator use lives here. Change a rule
 by editing this module, not by scattering literals through the engine.
 
-Phase-1 sizing
---------------
-The paper book is $1,000 so a two-week sample can absorb losers. Position
-size stays inside the $50–$100 band you would actually use on a $300 live
-bankroll. The paper book is not permission to bet more. A live-equivalent
-P&L column in the scorecard rescales results by 300/1000; the go/no-go rule
-uses the simulated dollars themselves.
+Sizing
+-------
+The paper book stays $1,000 so a sample can absorb losers. The dedicated
+live book Chad authorized is $500. Position size stays inside the $50–$100
+band on either book; the paper book is not permission to bet more. A
+live-equivalent P&L column rescales paper results by 500/1000. The go/no-go
+rule still uses the simulated paper dollars.
+
+The live halt is $350, a 30% drawdown from $500. The paper engine tracks a
+$1,000 book, so its halt is the same fraction remaining: $700.
 
 This module has no network, no keypair, and no transaction code.
 """
@@ -22,28 +25,52 @@ from dataclasses import asdict, dataclass
 # --- Bankroll and bet size (paper dollars) ---------------------------------
 
 PAPER_BANKROLL_USD = 1000.0
-LIVE_EQUIVALENT_BANKROLL_USD = 300.0
+LIVE_EQUIVALENT_BANKROLL_USD = 500.0
 POSITION_SIZE_USD = 75.0
 POSITION_SIZE_MIN_USD = 50.0
 POSITION_SIZE_MAX_USD = 100.0
 MAX_OPEN_POSITIONS = 3
-HALT_EQUITY_USD = 400.0
+# Live halt: $350 left on the $500 book (30% drawdown). Paper halt maps that
+# same remaining fraction onto the $1,000 book.
+LIVE_HALT_EQUITY_USD = 350.0
+HALT_EQUITY_USD = LIVE_HALT_EQUITY_USD * (PAPER_BANKROLL_USD / LIVE_EQUIVALENT_BANKROLL_USD)
+
+# Tracked-wallet and FOMO-copy alerts are information only. This flag is
+# audited False at import. The entry path also refuses those sources even if
+# a caller constructs a Rules copy with the flag flipped. There is no FOMO
+# credential, wallet, or auto-buy path in this package.
+ENTRY_SOURCE_COPY_ALLOWED = False
+COPY_ENTRY_SOURCES = frozenset(
+    {
+        "fomo_copy",
+        "tracked_wallet",
+        "wallet_copy",
+        "copy_trade",
+        "copy",
+    }
+)
 
 # --- Exits ------------------------------------------------------------------
 
 STOP_LOSS_PCT = -0.25
-TAKE_PROFIT_MULTIPLE = 2.0
-TRAIL_DROP_FROM_PEAK = 0.30
+# 1.5x partial is the edge rule. The old audit required 2x; that floor is gone.
+TAKE_PROFIT_MULTIPLE = 1.5
+TRAIL_DROP_FROM_PEAK = 0.25
+# Flatten whatever is left after four hours, measured from the paper entry.
+MAX_HOLD_MINUTES = 240
 
 # Flat fee charged on every fill (entry, partial take-profit, final exit, halt).
 FLAT_FEE_USD = 0.95
 
-# Slippage in basis points: a 1.5% base plus impact proportional to
+# Slippage in basis points: a 2.5% base plus impact proportional to
 # notional / pool liquidity. Capped so a thin remaining pool cannot
 # invent an infinite fill.
-BASE_SLIPPAGE_BPS = 150
+BASE_SLIPPAGE_BPS = 250
 IMPACT_SLIPPAGE_COEFF = 10_000.0
 MAX_SLIPPAGE_BPS = 800
+# Extra adverse move applied only on stop exits, on top of slippage.
+# Models a gap through the stop when the next scan is the first mark we see.
+STOP_GAP_EXTRA_PCT = 0.10
 
 # --- Safety checklist --------------------------------------------------------
 
@@ -60,11 +87,20 @@ WASH_BUY_SELL_HIGH = 1.33
 
 # Do not compete with launch snipers.
 MIN_AGE_MINUTES = 20
+# No buy within an hour of a detectable pump.fun graduation (the pumpswap
+# pair's creation time, or the earliest migrated pair when RugCheck marks
+# the mint as pump.fun). Not applied to tokens that are not pump.fun.
+MIN_MINUTES_SINCE_GRADUATION = 60
 
 # Holder gates. Pool, burn, and locker accounts are removed before the top-10 sum.
 MAX_TOP10_HOLDER_PCT = 40.0
 MAX_DEV_HOLDER_PCT = 10.0
-MAX_BUNDLE_PCT = 20.0
+MAX_BUNDLE_PCT = 15.0
+# Applied only when RugCheck (or the pair payload) actually includes a
+# linked-early-buyer or sniper percentage. The public report did not carry
+# that field when this was written, and insider-network size is not used as
+# a stand-in.
+MAX_LINKED_EARLY_BUYER_PCT = 25.0
 
 # LP must be burned, or locked at least this long by a known program.
 LP_MIN_LOCKED_PCT = 95.0
@@ -191,12 +227,16 @@ class Rules:
     position_size_min_usd: float = POSITION_SIZE_MIN_USD
     position_size_max_usd: float = POSITION_SIZE_MAX_USD
     max_open_positions: int = MAX_OPEN_POSITIONS
+    live_halt_equity_usd: float = LIVE_HALT_EQUITY_USD
     halt_equity_usd: float = HALT_EQUITY_USD
+    entry_source_copy_allowed: bool = ENTRY_SOURCE_COPY_ALLOWED
     stop_loss_pct: float = STOP_LOSS_PCT
     take_profit_multiple: float = TAKE_PROFIT_MULTIPLE
     trail_drop_from_peak: float = TRAIL_DROP_FROM_PEAK
+    max_hold_minutes: int = MAX_HOLD_MINUTES
     flat_fee_usd: float = FLAT_FEE_USD
     base_slippage_bps: int = BASE_SLIPPAGE_BPS
+    stop_gap_extra_pct: float = STOP_GAP_EXTRA_PCT
     impact_slippage_coeff: float = IMPACT_SLIPPAGE_COEFF
     max_slippage_bps: int = MAX_SLIPPAGE_BPS
     min_liquidity_usd: float = MIN_LIQUIDITY_USD
@@ -208,9 +248,11 @@ class Rules:
     wash_buy_sell_low: float = WASH_BUY_SELL_LOW
     wash_buy_sell_high: float = WASH_BUY_SELL_HIGH
     min_age_minutes: int = MIN_AGE_MINUTES
+    min_minutes_since_graduation: int = MIN_MINUTES_SINCE_GRADUATION
     max_top10_holder_pct: float = MAX_TOP10_HOLDER_PCT
     max_dev_holder_pct: float = MAX_DEV_HOLDER_PCT
     max_bundle_pct: float = MAX_BUNDLE_PCT
+    max_linked_early_buyer_pct: float = MAX_LINKED_EARLY_BUYER_PCT
     lp_min_locked_pct: float = LP_MIN_LOCKED_PCT
     min_lock_days: int = MIN_LOCK_DAYS
     github_recent_days: int = GITHUB_RECENT_DAYS
@@ -229,12 +271,26 @@ def _audit_rules(rules: Rules) -> None:
         raise RuntimeError("position size must sit inside the configured min/max band")
     if rules.halt_equity_usd >= rules.paper_bankroll_usd:
         raise RuntimeError("halt equity must be below the paper bankroll")
+    if rules.live_halt_equity_usd >= rules.live_equivalent_bankroll_usd:
+        raise RuntimeError("live halt must be below the live bankroll")
+    live_left = rules.live_halt_equity_usd / rules.live_equivalent_bankroll_usd
+    paper_left = rules.halt_equity_usd / rules.paper_bankroll_usd
+    if abs(live_left - paper_left) > 1e-9:
+        raise RuntimeError("paper halt must match the live halt as a fraction of the book")
+    if rules.entry_source_copy_allowed:
+        raise RuntimeError("tracked-wallet copy signals must not auto-buy")
     if rules.stop_loss_pct >= 0 or rules.stop_loss_pct <= -1:
         raise RuntimeError("stop-loss must be a negative fraction above -100%")
-    if rules.take_profit_multiple < 2:
-        raise RuntimeError("take-profit multiple must be at least 2x")
+    if rules.take_profit_multiple <= 1:
+        raise RuntimeError("take-profit multiple must be above 1x")
     if not 0 < rules.trail_drop_from_peak < 1:
         raise RuntimeError("trail drop must be a fraction between 0 and 1")
+    if rules.max_hold_minutes <= 0:
+        raise RuntimeError("max hold must be a positive number of minutes")
+    if not 0 <= rules.stop_gap_extra_pct < 0.5:
+        raise RuntimeError("stop gap must be a fraction from 0 up to 50%")
+    if rules.min_minutes_since_graduation < rules.min_age_minutes:
+        raise RuntimeError("graduation wait must be at least the minimum pair age")
     if rules.flat_fee_usd < 0:
         raise RuntimeError("fee cannot be negative")
     if rules.live_equivalent_bankroll_usd <= 0 or rules.paper_bankroll_usd <= 0:
@@ -252,5 +308,27 @@ def rules_dict(rules: Rules = RULES) -> dict:
 
 
 def live_equivalent_pnl(paper_pnl: float, rules: Rules = RULES) -> float:
-    """Rescale a paper P&L onto the $300 live book. Informational only."""
+    """Rescale a paper P&L onto the $500 live book. Informational only."""
     return paper_pnl * (rules.live_equivalent_bankroll_usd / rules.paper_bankroll_usd)
+
+
+def mcap_bucket(market_cap_usd: float | None) -> str:
+    """Bucket a USD market cap. 50–250k is called out because that was the edge cohort."""
+    if market_cap_usd is None or market_cap_usd <= 0:
+        return "unknown"
+    if market_cap_usd < 50_000:
+        return "<50k"
+    if market_cap_usd < 250_000:
+        return "50-250k"
+    if market_cap_usd < 1_000_000:
+        return "250k-1m"
+    if market_cap_usd < 10_000_000:
+        return "1m-10m"
+    return ">=10m"
+
+
+def is_copy_entry_source(source: str | None) -> bool:
+    """True for tracked-wallet / FOMO-copy labels. Those must not open a trade."""
+    if not source:
+        return False
+    return source.strip().lower() in COPY_ENTRY_SOURCES

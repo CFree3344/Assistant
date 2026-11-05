@@ -13,6 +13,12 @@ import duckdb
 from meme_terminal.config import RULES, rules_dict
 from meme_terminal.risk import Account, Position
 
+MIGRATIONS = (
+    "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS market_cap_usd DOUBLE",
+    "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS mcap_bucket VARCHAR",
+    "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_source VARCHAR",
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS account_state (
     id INTEGER PRIMARY KEY,
@@ -89,7 +95,10 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     liquidity_usd DOUBLE,
     last_mid DOUBLE,
     exit_reason VARCHAR,
-    updated_at VARCHAR
+    updated_at VARCHAR,
+    market_cap_usd DOUBLE,
+    mcap_bucket VARCHAR,
+    entry_source VARCHAR
 );
 CREATE TABLE IF NOT EXISTS trade_events (
     id VARCHAR PRIMARY KEY,
@@ -121,6 +130,19 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def iso(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -140,6 +162,8 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.con = duckdb.connect(str(self.path))
         self.con.execute(SCHEMA)
+        for statement in MIGRATIONS:
+            self.con.execute(statement)
         self._ensure_account()
 
     def close(self) -> None:
@@ -194,6 +218,10 @@ class Store:
                     status=row["status"],
                     liquidity_usd=row["liquidity_usd"],
                     last_mid=row["last_mid"],
+                    opened_at=_parse_iso(row.get("opened_at")),
+                    market_cap_usd=row.get("market_cap_usd"),
+                    mcap_bucket=row.get("mcap_bucket"),
+                    entry_source=row.get("entry_source") or "checklist",
                 )
             )
         account = Account(
@@ -225,7 +253,7 @@ class Store:
         self.con.execute(
             """
             INSERT INTO paper_trades VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             [
@@ -250,6 +278,9 @@ class Store:
                 position.last_mid,
                 exit_reason,
                 updated_at,
+                position.market_cap_usd,
+                position.mcap_bucket,
+                position.entry_source,
             ],
         )
 

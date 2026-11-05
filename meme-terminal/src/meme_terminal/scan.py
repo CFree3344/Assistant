@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from meme_terminal.checklist import RawInputs, evaluate, github_targets, mark_from_pairs
-from meme_terminal.config import MAJOR_QUOTES, RULES, Rules
+from meme_terminal.config import MAJOR_QUOTES, RULES, Rules, is_copy_entry_source
 from meme_terminal.http_client import FetchResult
 from meme_terminal.risk import TradeEvent, equity, mark_position, needs_halt, open_position
 from meme_terminal.sources import (
@@ -60,7 +60,7 @@ def run_scan(
         error_count += 1
         store.add_api_error(scan_id, mint, source, message, stamp)
 
-    account, fresh = _refresh_open(store, client, account, meta, scan_id, stamp, rules, note_error)
+    account, fresh = _refresh_open(store, client, account, meta, scan_id, stamp, rules, note_error, moment)
     if _marks_cover(account, fresh) and needs_halt(account, fresh, rules):
         account = _flatten(store, account, meta, fresh, scan_id, stamp, rules)
 
@@ -144,7 +144,7 @@ def _marks_cover(account, fresh: dict[str, float]) -> bool:
     return all(p.mint in fresh and fresh[p.mint] > 0 for p in account.open_positions())
 
 
-def _refresh_open(store, client, account, meta, scan_id, stamp, rules, note_error):
+def _refresh_open(store, client, account, meta, scan_id, stamp, rules, note_error, now):
     fresh: dict[str, float] = {}
     open_positions = account.open_positions()
     if not open_positions:
@@ -175,7 +175,7 @@ def _refresh_open(store, client, account, meta, scan_id, stamp, rules, note_erro
             continue
         fresh[position.mint] = float(mark["price"])
         store.add_snapshot(scan_id, position.mint, position.symbol, "dex_mark", stamp, by_mint.get(position.mint))
-        event = mark_position(position, mark["price"], mark.get("liquidity"), rules)
+        event = mark_position(position, mark["price"], mark.get("liquidity"), rules, now=now)
         if event is None:
             continue
         account = _commit_event(store, account, meta, event, scan_id, stamp)
@@ -245,6 +245,16 @@ def _screen_one(store, client, account, meta, mint, profile, source, scan_id, st
     if result.price_usd is None or result.liquidity_usd is None:
         store.add_decision(scan_id, mint, symbol, "skip_risk", "checklist passed without a usable price", stamp)
         return True, False, account, fresh
+    if is_copy_entry_source(source):
+        store.add_decision(
+            scan_id,
+            mint,
+            symbol,
+            "skip_copy",
+            "tracked-wallet copy signal is information only and cannot open a position",
+            stamp,
+        )
+        return True, False, account, fresh
     opened = open_position(
         account,
         trade_id=uuid.uuid4().hex,
@@ -254,6 +264,9 @@ def _screen_one(store, client, account, meta, mint, profile, source, scan_id, st
         mid=result.price_usd,
         liquidity_usd=result.liquidity_usd,
         rules=rules,
+        entry_source=source,
+        market_cap_usd=result.market_cap_usd,
+        opened_at=moment,
     )
     if opened[0] is None:
         store.add_decision(scan_id, mint, symbol, "skip_risk", str(opened[1]), stamp)

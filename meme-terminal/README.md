@@ -20,15 +20,17 @@ All of them live in `src/meme_terminal/config.py`.
 | Rule | Value |
 | --- | --- |
 | Paper bankroll | $1,000 |
-| Live-equivalent book | $300. Position size is the bet you would place on that book, not a scaled-up bet on the $1,000. |
+| Live-equivalent book | $500. Position size is the bet on that book, not a scaled-up bet on the $1,000. P&L rescales by 500/1000. |
 | Position size | $75, and never outside $50–$100 |
 | Max open | 3 |
-| Stop | -25% from the entry fill |
-| Take profit | sell half at 2x |
-| Trail | sell the rest on a 30% drop from the highest mark seen after the half sale |
-| Halt | flatten and stop opening if equity is $400 or less |
+| Stop | -25% from the entry fill, then an extra 10% modeled gap |
+| Take profit | sell half at 1.5x |
+| Trail | sell the rest on a 25% drop from the highest mark seen after the half sale |
+| Max hold | 240 minutes, then the remainder is sold |
+| Halt | $350 on the $500 live book (30% drawdown). Paper halt is the same fraction: $700. |
 | Fee | $0.95 per fill (entry, half sale, final exit, halt) |
-| Slippage | 1.5% plus a liquidity impact term, capped at 8% |
+| Slippage | 2.5% plus a liquidity impact term, capped at 8% |
+| Copy signals | Tracked-wallet and FOMO-copy alerts are information only. They never open a trade. |
 
 Checklist, all required:
 
@@ -37,9 +39,11 @@ Checklist, all required:
 - No Token-2022 freeze, transfer fee, transfer hook, pause, or permanent delegate.
 - At least 95% of liquidity burned, or locked at least 180 days by Streamflow, UNCX, or Jupiter Lock, with the locker account's owner confirmed on RPC. A lock claim with no unlock time fails. A short lock fails.
 - Top 10 wallets (pools, burn addresses, and lockers removed) at or under 40%.
-- Creator at or under 10%, and insider/bundle concentration at or under 20%.
+- Creator at or under 10%, and insider/bundle concentration at or under 15%.
+- Linked early buyers at or under 25% when RugCheck actually reports that percentage. The public report has no such field today, so the gate is recorded as not applied instead of inventing a number from insider networks.
 - At least $10,000 liquidity and $8,000 of volume that is not dust and does not look washed.
 - Pair at least 20 minutes old.
+- Pump.fun graduations (the pumpswap pair's creation time, when DexScreener or RugCheck shows one) must be at least 60 minutes old. A bonding-curve-only pump token is not bought. Tokens that are not pump.fun skip this gate.
 - A website or social link on the DexScreener profile or pair.
 - If the name, description, or links present the token as a launchpad, tool, or AI agent, every linked GitHub repo must exist, be non-trivial, and show recent commits. A fork with no commits of its own fails.
 
@@ -103,7 +107,9 @@ These fail closed, on purpose:
 - Wash trading is a heuristic: too few prints, sub-dollar average size, or balanced micro-prints with huge volume versus liquidity. It is not a unique-wallet proof. Thin or odd volume fails.
 - "Presents as a launchpad, tool, or AI agent" is detected from the DexScreener name, description, and links. The website body is not fetched. A claim that exists only on the site, with none of those phrases and no GitHub link, is not caught.
 - RugCheck's full report may start requiring a key. When a request fails, the token is skipped.
-- Prices between scans are invisible. Stops and trails fire on the next scan's mark, not on the path in between.
+- Prices between scans are invisible. Stops and trails fire on the next scan's mark, not on the path in between. Stop exits add a 10% gap on top of slippage to model that.
+- RugCheck's public report has no linked-early-buyer or sniper percentage (checked against a live report: holder rows expose `pct` and `insider` only). `MAX_LINKED_EARLY_BUYER_PCT` is wired for an explicit field and is not filled in from bundle size.
+- Tracked wallets and FOMO copy-trade feeds are not connected. Nothing in this repo stores FOMO credentials, and a copy-labeled signal cannot open a paper trade.
 
 ## Tests
 
@@ -111,4 +117,4 @@ These fail closed, on purpose:
 pytest
 ```
 
-Checklist and risk tests use mocked DexScreener, RugCheck, RPC, and GitHub payloads. One test runs a full scan against an in-memory fake client and checks that a clean token is paper-bought, a token with a live mint authority is skipped, a later 2x mark sells half, and the scorecard is NO-GO. Nothing in `src/` references signing, keypairs, or `sendTransaction`.
+Checklist and risk tests use mocked DexScreener, RugCheck, RPC, and GitHub payloads. One test runs a full scan against an in-memory fake client and checks that a clean token is paper-bought with a market-cap bucket, a token with a live mint authority is skipped, a later mark above 1.5x sells half, and the scorecard is NO-GO. Nothing in `src/` references signing, keypairs, or `sendTransaction`.

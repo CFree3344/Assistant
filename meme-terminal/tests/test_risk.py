@@ -1,6 +1,8 @@
 """Paper risk rules. No network."""
 
-from meme_terminal.config import RULES, PAPER_BANKROLL_USD, HALT_EQUITY_USD, FLAT_FEE_USD
+from datetime import datetime, timedelta, timezone
+
+from meme_terminal.config import RULES, PAPER_BANKROLL_USD, FLAT_FEE_USD, mcap_bucket
 from meme_terminal.reporting import decide, max_drawdown
 from meme_terminal.risk import (
     Account,
@@ -35,17 +37,30 @@ def _open(mid=1.0, liquidity=20_000, cash=PAPER_BANKROLL_USD):
     return account, event
 
 
-def test_constants_match_the_phase1_rules():
+def test_constants_match_the_edge_rules():
     assert RULES.paper_bankroll_usd == 1000
-    assert RULES.live_equivalent_bankroll_usd == 300
+    assert RULES.live_equivalent_bankroll_usd == 500
     assert RULES.position_size_min_usd <= RULES.position_size_usd <= RULES.position_size_max_usd
     assert RULES.position_size_usd == 75
     assert RULES.max_open_positions == 3
     assert RULES.stop_loss_pct == -0.25
-    assert RULES.take_profit_multiple == 2
-    assert RULES.trail_drop_from_peak == 0.30
-    assert RULES.halt_equity_usd == HALT_EQUITY_USD == 400
+    assert RULES.take_profit_multiple == 1.5
+    assert RULES.trail_drop_from_peak == 0.25
+    assert RULES.max_hold_minutes == 240
+    assert RULES.live_halt_equity_usd == 350
+    assert RULES.halt_equity_usd == 700
+    assert RULES.halt_equity_usd / RULES.paper_bankroll_usd == pytest_approx(350 / 500)
+    assert RULES.entry_source_copy_allowed is False
+    assert RULES.base_slippage_bps == 250
+    assert RULES.stop_gap_extra_pct == pytest_approx(0.10)
+    assert RULES.min_age_minutes == 20
+    assert RULES.min_minutes_since_graduation == 60
+    assert RULES.max_bundle_pct == 15
+    assert RULES.max_linked_early_buyer_pct == 25
     assert RULES.flat_fee_usd == FLAT_FEE_USD == 0.95
+    assert mcap_bucket(120_000) == "50-250k"
+    assert mcap_bucket(49_999) == "<50k"
+    assert mcap_bucket(250_000) == "250k-1m"
 
 
 def test_slippage_grows_as_the_pool_gets_thinner_and_never_exceeds_the_cap():
@@ -88,31 +103,29 @@ def test_stop_loss_is_worse_than_25_percent_after_fees_and_exit_slippage():
     )
     assert action.position.realized_pnl_usd < -0.25 * 75
     assert action.position.fees_usd == 0.95 * 2
+    plain = exit_fill(stop_mid, position.qty, 20_000)
+    assert action.fill.fill == pytest_approx(plain.fill * (1.0 - RULES.stop_gap_extra_pct))
 
 
-def test_half_is_sold_at_2x_and_the_trail_does_not_fire_before_that():
+def test_half_is_sold_at_1_5x_and_the_trail_is_25_percent():
     account, event = _open(mid=1.0)
     position = event.position
-    # A 50% rally is not a 2x on the fill, and it is not a stop.
-    hold = mark_position(position, position.entry_fill * 1.5, 20_000)
+    hold = mark_position(position, position.entry_fill * 1.2, 20_000)
     assert hold is not None and hold.kind == "mark" and hold.fill is None
     assert hold.position.half_sold is False
 
-    two_x = position.entry_fill * 2
-    partial = mark_position(position, two_x, 20_000)
+    target = position.entry_fill * 1.5
+    partial = mark_position(position, target, 20_000)
     assert partial.kind == "partial"
     assert partial.position.half_sold
     assert partial.position.status == "open"
     assert partial.fill.qty == pytest_approx(position.qty * 0.5)
     assert partial.position.remaining_qty == pytest_approx(position.qty * 0.5)
 
-    # Same print must not also trail out.
-    assert partial.position.status == "open"
-
-    peak = two_x
-    still = mark_position(partial.position, peak * 0.8, 20_000)
+    peak = target
+    still = mark_position(partial.position, peak * 0.80, 20_000)
     assert still.kind == "mark"
-    trailed = mark_position(partial.position, peak * 0.7, 20_000)
+    trailed = mark_position(partial.position, peak * 0.75, 20_000)
     assert trailed.kind == "trail"
     assert trailed.position.status == "closed"
     # Full round trip identity, both exit fills.
@@ -131,12 +144,12 @@ def test_a_missing_mark_does_not_stop_out_or_halt():
     assert needs_halt(account, marks) is False
 
 
-def test_halt_flattens_and_blocks_new_entries_at_400():
-    # A single $75 bet cannot drag a $1,000 book to $400, so start from a book
-    # that is already near the line and then mark the position down.
+def test_halt_maps_the_350_live_line_onto_the_paper_book():
+    # Paper halt is $700, the same 30% drawdown as $350 on the $500 live book.
+    assert needs_halt(Account(cash_usd=800, halted=False, positions=()), {}) is False
     account, event = _open(mid=1.0, liquidity=20_000, cash=450)
     marks = {event.position.mint: 0.01}
-    assert equity(account, marks) < 400
+    assert equity(account, marks) < RULES.halt_equity_usd
     assert needs_halt(account, marks)
     flat, events = flatten(account, marks)
     assert flat.halted
@@ -159,6 +172,39 @@ def test_halt_flattens_and_blocks_new_entries_at_400():
     assert needs_halt(broke, {})
     flat_cash, no_events = flatten(broke, {})
     assert flat_cash.halted and no_events == []
+
+
+def test_copy_signals_never_open_even_if_the_flag_is_forced_on():
+    from dataclasses import replace
+
+    forced = replace(RULES, entry_source_copy_allowed=True)
+    account, reason = open_position(
+        _account(),
+        trade_id="copy",
+        mint="Mint",
+        symbol="COPY",
+        pair_address="pair",
+        mid=1.0,
+        liquidity_usd=20_000,
+        rules=forced,
+        entry_source="fomo_copy",
+        market_cap_usd=120_000,
+    )
+    assert account is None
+    assert "information only" in reason
+
+
+def test_max_hold_flattens_the_remainder_after_240_minutes():
+    _account_state, event = _open(mid=1.0)
+    opened = datetime(2026, 11, 5, 12, 0, tzinfo=timezone.utc)
+    position = event.position
+    position = type(position)(**{**position.__dict__, "opened_at": opened})
+    still = mark_position(position, position.entry_fill, 20_000, now=opened + timedelta(minutes=239))
+    assert still is None or still.kind == "mark"
+    expired = mark_position(position, position.entry_fill, 20_000, now=opened + timedelta(minutes=240))
+    assert expired is not None
+    assert expired.kind == "max_hold"
+    assert expired.position.status == "closed"
 
 
 def test_three_open_positions_is_the_cap():

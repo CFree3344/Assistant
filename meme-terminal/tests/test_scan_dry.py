@@ -91,6 +91,8 @@ def test_scan_opens_only_the_clean_token_and_the_scorecard_says_no_go(tmp_path):
     assert trades[0]["mint"] == GOOD
     assert trades[0]["status"] == "open"
     assert trades[0]["initial_notional_usd"] == 75
+    assert trades[0]["mcap_bucket"] == "50-250k"
+    assert trades[0]["entry_source"] == "dex_profile"
     skipped = store.query("SELECT reason FROM decisions WHERE mint = ?", [BAD])
     assert skipped and "mint_authority_revoked" in skipped[0]["reason"]
     assert "sendTransaction" not in client.methods
@@ -113,6 +115,7 @@ def test_scan_opens_only_the_clean_token_and_the_scorecard_says_no_go(tmp_path):
     card = render_scorecard(load_scorecard(store))
     assert "NO-GO" in card
     assert "1 calls" in card or "Calls (entries): 1" in card
+    assert "50-250k" in card
     store.close()
 
 

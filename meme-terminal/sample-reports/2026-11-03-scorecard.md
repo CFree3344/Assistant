@@ -2,6 +2,8 @@
 
 Paper only. Go means this rule set cleared the pre-registered bar. It does not place an order.
 
+This scorecard is the 2026-11-03 scan under the previous rules. Later scans rescale P&L to the $500 live book and list each call's market-cap bucket, including 50–250k.
+
 ## Verdict: NO-GO
 
 2 calls so far, need 30; net after fees is $-7.47, need a positive result

@@ -7,11 +7,12 @@ There is no order type that leaves the machine.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Literal
 
-from meme_terminal.config import RULES, Rules
+from meme_terminal.config import RULES, Rules, is_copy_entry_source, mcap_bucket
 
-EventKind = Literal["open", "partial", "stop", "trail", "halt", "mark"]
+EventKind = Literal["open", "partial", "stop", "trail", "halt", "max_hold", "mark"]
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,10 @@ class Position:
     status: str
     liquidity_usd: float
     last_mid: float | None = None
+    opened_at: datetime | None = None
+    market_cap_usd: float | None = None
+    mcap_bucket: str | None = None
+    entry_source: str = "checklist"
 
     @property
     def open(self) -> bool:
@@ -100,14 +105,21 @@ def entry_fill(mid: float, notional_usd: float, liquidity_usd: float, rules: Rul
     )
 
 
-def exit_fill(mid: float, qty: float, liquidity_usd: float, rules: Rules = RULES) -> Fill:
+def exit_fill(
+    mid: float,
+    qty: float,
+    liquidity_usd: float,
+    rules: Rules = RULES,
+    extra_adverse_pct: float = 0.0,
+) -> Fill:
     if mid <= 0 or qty <= 0:
         raise ValueError("exit mark and quantity must be positive")
     # Impact uses the dollar size of the sale at the mid, before slippage.
     notional = qty * mid
     bps = slippage_bps(notional, liquidity_usd, rules)
     slip = bps / 10_000.0
-    fill = mid * (1.0 - slip)
+    gap = extra_adverse_pct if extra_adverse_pct > 0 else 0.0
+    fill = mid * (1.0 - slip) * (1.0 - gap)
     proceeds = qty * fill
     fee = rules.flat_fee_usd
     return Fill(
@@ -153,7 +165,14 @@ def open_position(
     mid: float,
     liquidity_usd: float,
     rules: Rules = RULES,
+    entry_source: str = "checklist",
+    market_cap_usd: float | None = None,
+    opened_at: datetime | None = None,
 ) -> tuple[Account, TradeEvent] | tuple[None, str]:
+    # Copy / FOMO wallet alerts never open a position. The flag is audited
+    # False; this refusal does not consult it, so flipping the flag is not enough.
+    if is_copy_entry_source(entry_source):
+        return None, "tracked-wallet copy signal is information only and cannot open a position"
     reason = can_open(account, rules)
     if reason:
         return None, reason
@@ -162,6 +181,7 @@ def open_position(
     notional = position_size_usd(account.cash_usd, rules)
     assert notional is not None
     fill = entry_fill(mid, notional, liquidity_usd, rules)
+    when = opened_at or datetime.now(timezone.utc)
     position = Position(
         trade_id=trade_id,
         mint=mint,
@@ -180,6 +200,10 @@ def open_position(
         status="open",
         liquidity_usd=liquidity_usd,
         last_mid=mid,
+        opened_at=when,
+        market_cap_usd=market_cap_usd,
+        mcap_bucket=mcap_bucket(market_cap_usd),
+        entry_source=entry_source,
     )
     updated = Account(
         cash_usd=account.cash_usd + fill.cash_delta,
@@ -208,7 +232,8 @@ def _apply_exit(
     the cost basis of the quantity sold. A full round trip therefore equals
     net sale proceeds minus the entry notional minus the entry fee.
     """
-    fill = exit_fill(mid, qty, liquidity_usd, rules)
+    extra = rules.stop_gap_extra_pct if kind == "stop" else 0.0
+    fill = exit_fill(mid, qty, liquidity_usd, rules, extra_adverse_pct=extra)
     cost = position.cost_remaining_usd * (qty / position.remaining_qty)
     remaining = position.remaining_qty - qty
     realized = position.realized_pnl_usd + fill.cash_delta - cost
@@ -233,8 +258,9 @@ def mark_position(
     mid: float | None,
     liquidity_usd: float | None,
     rules: Rules = RULES,
+    now: datetime | None = None,
 ) -> TradeEvent | None:
-    """Apply stop, 2x partial, or trail to one open position. None means hold."""
+    """Apply stop, partial, trail, or the max-hold flatten. None means hold."""
     if not position.open:
         return None
     if mid is None or mid <= 0:
@@ -242,6 +268,31 @@ def mark_position(
     liquidity = liquidity_usd if liquidity_usd and liquidity_usd > 0 else position.liquidity_usd
     peak = max(position.peak_mid, mid)
     updated = replace(position, peak_mid=peak, last_mid=mid, liquidity_usd=liquidity)
+    stop_px = updated.entry_fill * (1.0 + rules.stop_loss_pct)
+    if not updated.half_sold and mid <= stop_px:
+        return _apply_exit(
+            updated,
+            kind="stop",
+            qty=updated.remaining_qty,
+            mid=mid,
+            liquidity_usd=liquidity,
+            note="stop-loss at -25% from the entry fill, plus the modeled stop gap",
+            rules=rules,
+            close=True,
+            half_sold=False,
+        )
+    if _held_too_long(updated, now, rules):
+        return _apply_exit(
+            updated,
+            kind="max_hold",
+            qty=updated.remaining_qty,
+            mid=mid,
+            liquidity_usd=liquidity,
+            note=f"max hold of {rules.max_hold_minutes} minutes",
+            rules=rules,
+            close=True,
+            half_sold=updated.half_sold,
+        )
     if not updated.half_sold and mid >= updated.entry_fill * rules.take_profit_multiple:
         qty = min(updated.remaining_qty, updated.qty * 0.5)
         close = qty >= updated.remaining_qty - 1e-12
@@ -251,23 +302,10 @@ def mark_position(
             qty=qty,
             mid=mid,
             liquidity_usd=liquidity,
-            note="sold half at 2x",
+            note=f"sold half at {rules.take_profit_multiple:g}x",
             rules=rules,
             close=close,
             half_sold=True,
-        )
-    stop_px = updated.entry_fill * (1.0 + rules.stop_loss_pct)
-    if not updated.half_sold and mid <= stop_px:
-        return _apply_exit(
-            updated,
-            kind="stop",
-            qty=updated.remaining_qty,
-            mid=mid,
-            liquidity_usd=liquidity,
-            note="stop-loss at -25% from the entry fill",
-            rules=rules,
-            close=True,
-            half_sold=False,
         )
     if updated.half_sold and mid <= peak * (1.0 - rules.trail_drop_from_peak):
         return _apply_exit(
@@ -276,7 +314,7 @@ def mark_position(
             qty=updated.remaining_qty,
             mid=mid,
             liquidity_usd=liquidity,
-            note="trailed out on a 30% drop from the observed peak",
+            note=f"trailed out on a {rules.trail_drop_from_peak:.0%} drop from the observed peak",
             rules=rules,
             close=True,
             half_sold=True,
@@ -284,6 +322,16 @@ def mark_position(
     if updated.peak_mid != position.peak_mid or updated.last_mid != position.last_mid:
         return TradeEvent("mark", updated, None, "mark updated")
     return None
+
+
+def _held_too_long(position: Position, now: datetime | None, rules: Rules) -> bool:
+    if now is None or position.opened_at is None:
+        return False
+    opened = position.opened_at
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    minutes = (now - opened).total_seconds() / 60.0
+    return minutes >= rules.max_hold_minutes
 
 
 def apply_event(account: Account, event: TradeEvent) -> Account:

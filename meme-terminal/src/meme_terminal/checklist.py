@@ -24,7 +24,19 @@ from meme_terminal.config import (
     TOKEN_PROGRAM,
     Rules,
     RULES,
+    mcap_bucket,
 )
+
+PUMP_AMM_DEX_IDS = frozenset({"pumpswap"})
+PUMP_BONDING_DEX_IDS = frozenset({"pumpfun", "pump.fun", "pump-fun"})
+_EARLY_PCT_KEYS = (
+    "linkedEarlyBuyersPct",
+    "linked_early_buyer_pct",
+    "earlyBuyerPct",
+    "sniperPct",
+    "snipersPct",
+)
+_EARLY_BLOCK_KEYS = ("linkedEarlyBuyers", "earlyBuyers", "snipers")
 
 GITHUB_REPO_RE = re.compile(
     r"https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
@@ -52,6 +64,8 @@ class ChecklistResult:
     price_usd: float | None
     liquidity_usd: float | None
     pair_address: str | None
+    market_cap_usd: float | None = None
+    mcap_bucket: str = "unknown"
 
     def failures(self) -> list[Check]:
         return [c for c in self.checks if not c.passed]
@@ -96,9 +110,11 @@ def evaluate(raw: RawInputs, rules: Rules = RULES, now: datetime | None = None) 
         _check_lp(rug, raw, rules, now),
         _check_top10(rug, rules),
         _check_dev_and_bundle(rug, rules),
+        _check_linked_early_buyers(rug, rules),
         _check_liquidity(market, rules),
         _check_volume(market, rules),
         _check_age(market, rules, now),
+        _check_graduation(market, rug, rules, now),
         _check_socials(market),
         _check_github(market, raw.github, rules, now),
     )
@@ -112,6 +128,8 @@ def evaluate(raw: RawInputs, rules: Rules = RULES, now: datetime | None = None) 
         price_usd=market.get("price"),
         liquidity_usd=market.get("liquidity"),
         pair_address=market.get("pair_address"),
+        market_cap_usd=market.get("market_cap"),
+        mcap_bucket=mcap_bucket(market.get("market_cap")),
     )
 
 
@@ -310,6 +328,11 @@ def _parse_market(
         "github_repos": [],
         "product_claim": False,
         "pair_address": None,
+        "dex_id": None,
+        "dex_ids": [],
+        "market_cap": None,
+        "graduation_at": None,
+        "bonding_curve_only": False,
         "error": None,
     }
     pairs = _pair_list(dex_pairs)
@@ -356,6 +379,20 @@ def _parse_market(
     view["volume"] = _num(volume)
     view["buys"] = txns.get("buys") if isinstance(txns, dict) else None
     view["sells"] = txns.get("sells") if isinstance(txns, dict) else None
+    view["dex_id"] = pair.get("dexId")
+    view["market_cap"] = _num(pair.get("marketCap"))
+    if view["market_cap"] is None:
+        view["market_cap"] = _num(pair.get("fdv"))
+    dex_ids = {str(item.get("dexId") or "").lower() for _liq, item in eligible}
+    view["dex_ids"] = sorted(dex_ids)
+    grad_times = [
+        _parse_time(item.get("pairCreatedAt"))
+        for _liq, item in eligible
+        if str(item.get("dexId") or "").lower() in PUMP_AMM_DEX_IDS
+    ]
+    grad_times = [stamp for stamp in grad_times if stamp is not None]
+    view["graduation_at"] = min(grad_times) if grad_times else None
+    view["bonding_curve_only"] = bool(dex_ids & PUMP_BONDING_DEX_IDS) and not grad_times
     _apply_profile_text(view, profile, pair)
     return view
 
@@ -906,6 +943,122 @@ def _check_dev_and_bundle(rug: dict[str, Any], rules: Rules) -> Check:
         f"creator holds {dev_pct:.1f}% and bundle concentration is {bundle_pct:.1f}% ({bundle_note})",
         dev_pct=round(dev_pct, 2),
         bundle_pct=round(bundle_pct, 2),
+    )
+
+
+def _explicit_early_buyer_pct(report: dict[str, Any]) -> float | None | str:
+    """A percentage, None when the payload has no such field, or 'bad' when the field is unreadable."""
+    for key in _EARLY_PCT_KEYS:
+        if key in report:
+            value = _num(report.get(key))
+            return value if value is not None else "bad"
+    for key in _EARLY_BLOCK_KEYS:
+        if key not in report:
+            continue
+        block = report.get(key)
+        if isinstance(block, dict):
+            value = _num(block.get("pct"))
+            return value if value is not None else "bad"
+        if isinstance(block, list):
+            total = 0.0
+            for row in block:
+                if not isinstance(row, dict) or "pct" not in row:
+                    return "bad"
+                value = _num(row.get("pct"))
+                if value is None:
+                    return "bad"
+                total += value
+            return total
+        return "bad"
+    rows = report.get("topHolders")
+    if isinstance(rows, list):
+        flagged = False
+        total = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if any(key in row for key in ("earlyBuyer", "sniper", "linkedEarly")):
+                flagged = True
+                if row.get("earlyBuyer") or row.get("sniper") or row.get("linkedEarly"):
+                    value = _num(row.get("pct"))
+                    if value is None:
+                        return "bad"
+                    total += value
+        if flagged:
+            return total
+    return None
+
+
+def _check_linked_early_buyers(rug: dict[str, Any], rules: Rules) -> Check:
+    name = "linked_early_buyers"
+    if not rug.get("ok"):
+        return _fail(name, f"cannot verify: {rug.get('error')}")
+    found = _explicit_early_buyer_pct(rug["report"])
+    if found is None:
+        return _ok(
+            name,
+            "RugCheck did not report linked early-buyer concentration; gate not applied",
+            applied=False,
+        )
+    if found == "bad":
+        return _fail(name, "cannot verify: linked early-buyer field was present but not a percentage")
+    pct = float(found)
+    if pct > rules.max_linked_early_buyer_pct:
+        return _fail(
+            name,
+            f"linked early buyers hold {pct:.1f}% (limit {rules.max_linked_early_buyer_pct:.0f}%)",
+            early_pct=round(pct, 2),
+        )
+    return _ok(
+        name,
+        f"linked early buyers hold {pct:.1f}%",
+        early_pct=round(pct, 2),
+        applied=True,
+    )
+
+
+def _is_pump_launch(market: dict[str, Any], rug: dict[str, Any]) -> bool:
+    dex_ids = {str(item).lower() for item in market.get("dex_ids") or []}
+    if market.get("dex_id"):
+        dex_ids.add(str(market["dex_id"]).lower())
+    if dex_ids & (PUMP_AMM_DEX_IDS | PUMP_BONDING_DEX_IDS):
+        return True
+    report = rug["report"] if rug.get("ok") else {}
+    launch = report.get("launchpad") if isinstance(report, dict) else None
+    if isinstance(launch, dict):
+        blob = f"{launch.get('platform') or ''} {launch.get('name') or ''}".lower()
+        if "pump" in blob:
+            return True
+    markets = report.get("markets") if isinstance(report, dict) else None
+    if isinstance(markets, list):
+        for item in markets:
+            if isinstance(item, dict) and "pump" in str(item.get("marketType") or "").lower():
+                return True
+    return False
+
+
+def _check_graduation(market: dict[str, Any], rug: dict[str, Any], rules: Rules, now: datetime) -> Check:
+    name = "minutes_since_graduation"
+    if not _is_pump_launch(market, rug):
+        return _ok(name, "not a pump.fun launch; graduation wait not applied")
+    if market.get("bonding_curve_only"):
+        return _fail(name, "still on the pump.fun bonding curve; not graduated")
+    graduated = market.get("graduation_at") or market.get("pair_created")
+    if graduated is None:
+        return _fail(name, "cannot verify: pump.fun graduation time was not on the pair")
+    if graduated > now + timedelta(minutes=2):
+        return _fail(name, "pump.fun graduation time is in the future")
+    age_min = (now - graduated).total_seconds() / 60.0
+    if age_min < rules.min_minutes_since_graduation:
+        return _fail(
+            name,
+            f"graduated {age_min:.0f} minutes ago; waiting until {rules.min_minutes_since_graduation} minutes",
+            age_minutes=round(age_min, 1),
+        )
+    return _ok(
+        name,
+        f"pump.fun graduation was {age_min / 60:.1f} hours ago",
+        age_minutes=round(age_min, 1),
     )
 
 
