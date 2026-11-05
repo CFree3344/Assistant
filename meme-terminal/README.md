@@ -21,7 +21,7 @@ All of them live in `src/meme_terminal/config.py`.
 | --- | --- |
 | Paper bankroll | $1,000 |
 | Live-equivalent book | $500. Position size is the bet on that book, not a scaled-up bet on the $1,000. P&L rescales by 500/1000. |
-| Position size | $75, and never outside $50–$100 |
+| Position size | $75 paper ticket, inside $50–$100 for paper scoring only. That band is not a live sizing rule. |
 | Max open | 3 |
 | Stop | -25% from the entry fill, then an extra 10% modeled gap |
 | Take profit | sell half at 1.5x |
@@ -32,7 +32,7 @@ All of them live in `src/meme_terminal/config.py`.
 | Slippage | 2.5% plus a liquidity impact term, capped at 8% |
 | Copy signals | Tracked-wallet and FOMO-copy alerts are information only. They never open a trade. |
 
-Checklist, all required:
+Entry gates:
 
 - Mint authority revoked, on RugCheck and on a parsed Solana RPC mint account.
 - Freeze authority revoked, same two sources.
@@ -40,14 +40,29 @@ Checklist, all required:
 - At least 95% of liquidity burned, or locked at least 180 days by Streamflow, UNCX, or Jupiter Lock, with the locker account's owner confirmed on RPC. A lock claim with no unlock time fails. A short lock fails.
 - Top 10 wallets (pools, burn addresses, and lockers removed) at or under 40%.
 - Creator at or under 10%, and insider/bundle concentration at or under 15%.
-- Linked early buyers at or under 25% when RugCheck actually reports that percentage. The public report has no such field today, so the gate is recorded as not applied instead of inventing a number from insider networks.
+- Linked early buyers at or under 25% when that percentage is actually present. The same cap applies to a coordinated-buy field when that field is present. A missing field is `NOT_APPLIED`. Insider-network size is not used as a stand-in.
+- Bundle held at launch at or under 15% when a launch-time field is present (`bundleHeldAtLaunchPct`, an insider network's `initialHolding`, or a holder flag such as `bundledAtLaunch`). Current wallet balances are not copied into that gate. The separate creator and current-bundle cap remains 15%, and a missing insider report still fails that current-holding check.
 - At least $10,000 liquidity and $8,000 of volume that is not dust and does not look washed.
+- Sell-side impact for the $75 paper ticket at or under 300 bps of modeled slippage, and at or under 1.5% of quote-side liquidity when a market reports `quoteUSD`. A missing quote figure is not invented; the slippage check still runs off pool liquidity.
+- Market cap inside $50,000–$250,000. A missing cap fails closed.
 - Pair at least 20 minutes old.
-- Pump.fun graduations (the pumpswap pair's creation time, when DexScreener or RugCheck shows one) must be at least 60 minutes old. A bonding-curve-only pump token is not bought. Tokens that are not pump.fun skip this gate.
+- Pump.fun graduations (the pumpswap pair's creation time, when DexScreener or RugCheck shows one) must be at least 60 minutes old. A bonding-curve-only pump token is not bought. Tokens that are not pump.fun are `NOT_APPLIED` on this gate.
+- Late chase: a 1-minute move of 50% or more, or a 5-minute move of 80% or more, is already vertical and fails. A 1-minute move of 25% or a 5-minute move of 40% fails when that same window's flow is present and weak (thin prints, one-sided buys, dust, or wash-shaped volume). A missing 1m/5m tape is `NOT_APPLIED`. Flow from a different window is not substituted, and missing flow is not treated as demand.
+- RugCheck `rugged`, a fail status, or a danger-level risk skips the name. A report with no risk list does not get an invented clean bill of health; that row is `NOT_APPLIED` while the mint, freeze, and LP checks still have to pass on their own.
 - A website or social link on the DexScreener profile or pair.
 - If the name, description, or links present the token as a launchpad, tool, or AI agent, every linked GitHub repo must exist, be non-trivial, and show recent commits. A fork with no commits of its own fails.
 
-The scorecard says **GO** only after 30 entries and a positive net result after fees (open positions marked at the bid). Anything else is **NO-GO**.
+Each mint also gets an entry scorecard. Every gate is `PASS`, `FAIL`, or `NOT_APPLIED`, and the mint is **GO** only when nothing is `FAIL`. `NOT_APPLIED` does not vote and is not a demand reading. The slots are:
+
+| Source | What it can fail | When the payload is absent |
+| --- | --- | --- |
+| On-chain (RugCheck, Solana RPC, DexScreener) | Mint, freeze, LP, holders, age, graduation, liquidity, volume, market cap, sell impact, late chase | Required safety fields fail closed. Optional concentration and tape fields are `NOT_APPLIED`. |
+| StalkChain | An explicit on-chain fail, or a present bundle / sniper / coordinated-buy percent over the same caps | `NOT_APPLIED`. The scan does not call StalkChain. |
+| FOMO warnings | A danger-level warning, or a payload that says the source failed | `NOT_APPLIED`. A copy or leaderboard flag does not open a buy. |
+| X | An explicit inorganic or bot-spam flag | `NOT_APPLIED`. Mention counts are not invented. |
+| Padre | A present bundle or coordinated-buy percent over the cap, or a danger-level warning | `NOT_APPLIED`. The scan does not call Padre. |
+
+The two-week paper scorecard is separate. It says **GO** only after 30 entries and a positive net result after fees (open positions marked at the bid). Anything else is **NO-GO**. That verdict scores the rule set. It does not place an order.
 
 ## Setup
 
@@ -108,8 +123,9 @@ These fail closed, on purpose:
 - "Presents as a launchpad, tool, or AI agent" is detected from the DexScreener name, description, and links. The website body is not fetched. A claim that exists only on the site, with none of those phrases and no GitHub link, is not caught.
 - RugCheck's full report may start requiring a key. When a request fails, the token is skipped.
 - Prices between scans are invisible. Stops and trails fire on the next scan's mark, not on the path in between. Stop exits add a 10% gap on top of slippage to model that.
-- RugCheck's public report has no linked-early-buyer or sniper percentage (checked against a live report: holder rows expose `pct` and `insider` only). `MAX_LINKED_EARLY_BUYER_PCT` is wired for an explicit field and is not filled in from bundle size.
-- Tracked wallets and FOMO copy-trade feeds are not connected. Nothing in this repo stores FOMO credentials, and a copy-labeled signal cannot open a paper trade.
+- RugCheck's public report has no linked-early-buyer or sniper percentage (checked against a live report: holder rows expose `pct` and `insider` only). `MAX_LINKED_EARLY_BUYER_PCT` is wired for an explicit field and is not filled in from bundle size. Held-at-launch bundle data is the same: current insider holdings stay on the current-bundle check and are not relabeled as launch concentration.
+- DexScreener's `priceChange` object is the only 1m/5m tape this checklist reads. Pairs that omit it do not get a synthetic pump or a synthetic "organic" pass.
+- StalkChain, FOMO warning feeds, X, and Padre are optional payload slots on `RawInputs`. The scanner leaves them empty. Nothing in this repo stores credentials for those services. Tracked-wallet and FOMO copy feeds are not connected, and a copy-labeled signal cannot open a paper trade.
 
 ## Tests
 
@@ -117,4 +133,4 @@ These fail closed, on purpose:
 pytest
 ```
 
-Checklist and risk tests use mocked DexScreener, RugCheck, RPC, and GitHub payloads. One test runs a full scan against an in-memory fake client and checks that a clean token is paper-bought with a market-cap bucket, a token with a live mint authority is skipped, a later mark above 1.5x sells half, and the scorecard is NO-GO. Nothing in `src/` references signing, keypairs, or `sendTransaction`.
+Checklist and risk tests use mocked DexScreener, RugCheck, RPC, and GitHub payloads. One test runs a full scan against an in-memory fake client and checks that a clean token is paper-bought with a market-cap bucket, a token with a live mint authority is skipped, a later mark above 1.5x sells half, and the two-week scorecard is NO-GO. Entry-gate tests cover the market-cap band, sell impact, late chase, launch bundle, coordinated buys, and the StalkChain / FOMO / X / Padre slots, including `NOT_APPLIED` when the field is missing. Nothing in `src/` references signing, keypairs, or `sendTransaction`.
