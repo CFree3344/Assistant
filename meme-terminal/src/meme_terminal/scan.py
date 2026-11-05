@@ -208,6 +208,8 @@ def _screen_one(store, client, account, meta, mint, profile, source, scan_id, st
     rpc_lp, largest, lp_accounts, locker_accounts, lp_errors = _lp_context(client, rug_data)
     for src, message in lp_errors:
         note_error(src, message, mint)
+    # StalkChain, FOMO, X, and Padre stay unset. This scan does not call them.
+    # Missing intel is NOT_APPLIED inside the checklist; it is not filled in.
     raw = RawInputs(
         mint=mint,
         dex_pairs=pairs.data if pairs.ok else None,
@@ -240,7 +242,7 @@ def _screen_one(store, client, account, meta, mint, profile, source, scan_id, st
         store.add_check(scan_id, mint, symbol, check.name, check.passed, check.reason, check.evidence, stamp)
     if not result.passed:
         reason = "; ".join(f"{c.name}: {c.reason}" for c in result.failures())
-        store.add_decision(scan_id, mint, symbol, "skip_checklist", reason, stamp)
+        store.add_decision(scan_id, mint, symbol, "skip_checklist", f"NO-GO: {reason}", stamp)
         return False, False, account, fresh
     if result.price_usd is None or result.liquidity_usd is None:
         store.add_decision(scan_id, mint, symbol, "skip_risk", "checklist passed without a usable price", stamp)

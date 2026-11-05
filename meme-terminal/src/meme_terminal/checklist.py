@@ -1,8 +1,15 @@
-"""Safety checklist.
+"""Safety checklist and per-mint entry scorecard.
 
-Every check is pure: it reads already-fetched JSON and returns pass or fail.
-A missing, empty, or contradictory source is a fail. Nothing here sends a
-transaction or contacts the network.
+Required safety checks fail closed: a missing mint, freeze, pool, or RugCheck
+report is a FAIL and the name is skipped. Optional fields (held-at-launch
+bundle, linked early buyers, coordinated buys, the 1m/5m tape, and the
+StalkChain, FOMO, X, and Padre slots) are NOT_APPLIED when the payload does
+not contain them. A missing optional field is never filled in with demand,
+flow, or a concentration number.
+
+The entry verdict is GO only when no gate is FAIL. NOT_APPLIED does not vote
+and does not open a trade. Nothing here sends a transaction or contacts the
+network. FOMO and leaderboard payloads are information only.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from meme_terminal.config import (
     RULES,
     mcap_bucket,
 )
+from meme_terminal.risk import slippage_bps
 
 PUMP_AMM_DEX_IDS = frozenset({"pumpswap"})
 PUMP_BONDING_DEX_IDS = frozenset({"pumpfun", "pump.fun", "pump-fun"})
@@ -37,6 +45,42 @@ _EARLY_PCT_KEYS = (
     "snipersPct",
 )
 _EARLY_BLOCK_KEYS = ("linkedEarlyBuyers", "earlyBuyers", "snipers")
+_COORD_PCT_KEYS = (
+    "coordinatedBuyPct",
+    "coordinated_buy_pct",
+    "coordinatedBuysPct",
+    "coordinatedPct",
+)
+_COORD_BLOCK_KEYS = ("coordinatedBuys", "coordinatedBuyers", "coordinated")
+_LAUNCH_PCT_KEYS = (
+    "bundleHeldAtLaunchPct",
+    "heldAtLaunchPct",
+    "launchBundlePct",
+    "bundleAtLaunchPct",
+    "launchBundleHeldPct",
+)
+_LAUNCH_HOLDING_KEYS = ("initialHolding", "launchHolding", "heldAtLaunch", "tokensAtLaunch")
+_LAUNCH_ROW_FLAGS = ("bundledAtLaunch", "launchBundle", "heldAtLaunch")
+_M1_KEYS = ("m1", "1m")
+_M5_KEYS = ("m5", "5m")
+_HARD_LEVELS = frozenset({"danger", "critical", "error", "fail", "failed", "high"})
+_FAIL_STATUSES = frozenset({"fail", "failed", "danger", "rug", "rugged", "high", "critical"})
+_STALK_BOOL_FAILS = (
+    ("mint_authority_revoked", "mint authority still active"),
+    ("freeze_authority_revoked", "freeze authority still active"),
+    ("lp_burned", "LP is not burned"),
+    ("lp_locked", "LP is not locked"),
+)
+_STALK_PCTS = (
+    ("bundle_held_at_launch_pct", "max_bundle_pct", "bundle held at launch"),
+    ("bundleHeldAtLaunchPct", "max_bundle_pct", "bundle held at launch"),
+    ("sniper_pct", "max_linked_early_buyer_pct", "snipers"),
+    ("sniperPct", "max_linked_early_buyer_pct", "snipers"),
+    ("linked_early_buyer_pct", "max_linked_early_buyer_pct", "linked early buyers"),
+    ("linkedEarlyBuyersPct", "max_linked_early_buyer_pct", "linked early buyers"),
+    ("coordinated_buy_pct", "max_linked_early_buyer_pct", "coordinated buys"),
+    ("coordinatedBuyPct", "max_linked_early_buyer_pct", "coordinated buys"),
+)
 
 GITHUB_REPO_RE = re.compile(
     r"https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
@@ -48,10 +92,18 @@ SKIP_GITHUB_OWNERS = frozenset({"orgs", "topics", "features", "settings", "marke
 
 @dataclass(frozen=True)
 class Check:
+    """One gate.
+
+    `passed` is True for PASS and NOT_APPLIED. Only FAIL blocks the entry
+    verdict. NOT_APPLIED means the field was absent; it is not a demand reading.
+    """
+
     name: str
     passed: bool
     reason: str
     evidence: dict[str, Any] = field(default_factory=dict)
+    status: str = "FAIL"
+    source: str = "onchain"
 
 
 @dataclass(frozen=True)
@@ -68,7 +120,12 @@ class ChecklistResult:
     mcap_bucket: str = "unknown"
 
     def failures(self) -> list[Check]:
-        return [c for c in self.checks if not c.passed]
+        return [c for c in self.checks if c.status == "FAIL"]
+
+    @property
+    def verdict(self) -> str:
+        """Single entry go/no-go. NOT_APPLIED gates do not vote."""
+        return "GO" if self.passed else "NO-GO"
 
 
 @dataclass
@@ -96,6 +153,12 @@ class RawInputs:
     rpc_lp_accounts: list[dict[str, Any] | None] | None = None
     rpc_locker_accounts: dict[str, dict[str, Any] | None] | None = None
     github: list[GithubRepoInput] | None = None
+    # Optional intel. None means that source was not fetched. The scanner does
+    # not fill these in, and a missing payload is NOT_APPLIED rather than a guess.
+    stalkchain: dict[str, Any] | None = None
+    fomo: dict[str, Any] | None = None
+    x_intel: dict[str, Any] | None = None
+    padre: dict[str, Any] | None = None
 
 
 def evaluate(raw: RawInputs, rules: Rules = RULES, now: datetime | None = None) -> ChecklistResult:
@@ -104,21 +167,31 @@ def evaluate(raw: RawInputs, rules: Rules = RULES, now: datetime | None = None) 
     rug = _parse_rug(raw.rug_report)
     rpc = _parse_rpc_mint(raw.rpc_mint)
     checks = (
+        _check_rugcheck_onchain(rug),
         _check_mint_authority(rug, rpc),
         _check_freeze_authority(rug, rpc),
         _check_extensions(rug, rpc),
         _check_lp(rug, raw, rules, now),
         _check_top10(rug, rules),
         _check_dev_and_bundle(rug, rules),
+        _check_bundle_at_launch(rug, rules),
         _check_linked_early_buyers(rug, rules),
+        _check_coordinated_buys(rug, rules),
         _check_liquidity(market, rules),
         _check_volume(market, rules),
+        _check_sell_exit_impact(market, rug, rules),
+        _check_market_cap(market, rules),
         _check_age(market, rules, now),
         _check_graduation(market, rug, rules, now),
+        _check_late_chase(market, rules),
         _check_socials(market),
         _check_github(market, raw.github, rules, now),
+        _check_stalkchain(raw.stalkchain, rules),
+        _check_fomo(raw.fomo),
+        _check_x_intel(raw.x_intel),
+        _check_padre(raw.padre, rules),
     )
-    passed = all(c.passed for c in checks)
+    passed = not any(c.status == "FAIL" for c in checks)
     return ChecklistResult(
         mint=raw.mint,
         symbol=market.get("symbol"),
@@ -159,12 +232,58 @@ def github_targets(raw: RawInputs) -> list[tuple[str, str]]:
     return list(market.get("github_repos") or [])
 
 
-def _fail(name: str, reason: str, **evidence: Any) -> Check:
-    return Check(name, False, reason, evidence)
+def render_entry_scorecard(result: ChecklistResult) -> str:
+    """One mint, one verdict, and a PASS / FAIL / NOT_APPLIED row per gate."""
+    lines = [
+        f"# Entry scorecard — {result.symbol or result.mint}",
+        "",
+        f"Verdict: {result.verdict}",
+        "",
+        "GO means every gate is PASS or NOT_APPLIED. It does not open a trade. "
+        "NOT_APPLIED means that field was missing; no demand, flow, or concentration number was filled in.",
+        "",
+        "| Gate | Source | Status |",
+        "| --- | --- | --- |",
+    ]
+    for check in result.checks:
+        lines.append(f"| `{check.name}` | {check.source} | {check.status} |")
+    lines.append("")
+    fails = result.failures()
+    if fails:
+        lines.append("## Failures")
+        lines.append("")
+        for check in fails:
+            lines.append(f"- `{check.name}` ({check.source}): {check.reason}")
+        lines.append("")
+    return "\n".join(lines)
 
 
-def _ok(name: str, reason: str, **evidence: Any) -> Check:
-    return Check(name, True, reason, evidence)
+def _gate(name: str, status: str, reason: str, source: str = "onchain", **evidence: Any) -> Check:
+    if status not in {"PASS", "FAIL", "NOT_APPLIED"}:
+        raise ValueError(f"unknown gate status {status}")
+    body = dict(evidence)
+    body["status"] = status
+    body["source"] = source
+    return Check(
+        name=name,
+        passed=status != "FAIL",
+        reason=reason,
+        evidence=body,
+        status=status,
+        source=source,
+    )
+
+
+def _fail(name: str, reason: str, source: str = "onchain", **evidence: Any) -> Check:
+    return _gate(name, "FAIL", reason, source, **evidence)
+
+
+def _ok(name: str, reason: str, source: str = "onchain", **evidence: Any) -> Check:
+    return _gate(name, "PASS", reason, source, **evidence)
+
+
+def _na(name: str, reason: str, source: str = "onchain", **evidence: Any) -> Check:
+    return _gate(name, "NOT_APPLIED", reason, source, **evidence)
 
 
 def _num(value: Any) -> float | None:
@@ -333,6 +452,11 @@ def _parse_market(
         "market_cap": None,
         "graduation_at": None,
         "bonding_curve_only": False,
+        "price_change_m1": None,
+        "price_change_m5": None,
+        "price_change_bad": [],
+        "flow_m1": None,
+        "flow_m5": None,
         "error": None,
     }
     pairs = _pair_list(dex_pairs)
@@ -393,6 +517,12 @@ def _parse_market(
     grad_times = [stamp for stamp in grad_times if stamp is not None]
     view["graduation_at"] = min(grad_times) if grad_times else None
     view["bonding_curve_only"] = bool(dex_ids & PUMP_BONDING_DEX_IDS) and not grad_times
+    changes = _short_window_changes(pair)
+    view["price_change_m1"] = changes["m1"]
+    view["price_change_m5"] = changes["m5"]
+    view["price_change_bad"] = changes["bad"]
+    view["flow_m1"] = _short_flow(pair, "m1")
+    view["flow_m5"] = _short_flow(pair, "m5")
     _apply_profile_text(view, profile, pair)
     return view
 
@@ -995,7 +1125,7 @@ def _check_linked_early_buyers(rug: dict[str, Any], rules: Rules) -> Check:
         return _fail(name, f"cannot verify: {rug.get('error')}")
     found = _explicit_early_buyer_pct(rug["report"])
     if found is None:
-        return _ok(
+        return _na(
             name,
             "RugCheck did not report linked early-buyer concentration; gate not applied",
             applied=False,
@@ -1015,6 +1145,591 @@ def _check_linked_early_buyers(rug: dict[str, Any], rules: Rules) -> Check:
         early_pct=round(pct, 2),
         applied=True,
     )
+
+
+def _block_pct(report: dict[str, Any], pct_keys: tuple[str, ...], block_keys: tuple[str, ...]) -> float | None | str:
+    """A percentage, None when no such field exists, or 'bad' when the field is unreadable."""
+    for key in pct_keys:
+        if key in report:
+            value = _num(report.get(key))
+            return value if value is not None else "bad"
+    for key in block_keys:
+        if key not in report:
+            continue
+        block = report.get(key)
+        if isinstance(block, dict):
+            if "pct" not in block:
+                return "bad"
+            value = _num(block.get("pct"))
+            return value if value is not None else "bad"
+        if isinstance(block, list):
+            total = 0.0
+            saw = False
+            for row in block:
+                if not isinstance(row, dict) or "pct" not in row:
+                    return "bad"
+                value = _num(row.get("pct"))
+                if value is None:
+                    return "bad"
+                total += value
+                saw = True
+            return total if saw else 0.0
+        return "bad"
+    return None
+
+
+def _check_coordinated_buys(rug: dict[str, Any], rules: Rules) -> Check:
+    name = "coordinated_buys"
+    if not rug.get("ok"):
+        return _fail(name, f"cannot verify: {rug.get('error')}")
+    found = _block_pct(rug["report"], _COORD_PCT_KEYS, _COORD_BLOCK_KEYS)
+    if found is None:
+        return _na(
+            name,
+            "no coordinated-buy field was reported; gate not applied",
+            applied=False,
+        )
+    if found == "bad":
+        return _fail(name, "cannot verify: coordinated-buy field was present but not a percentage")
+    pct = float(found)
+    limit = rules.max_linked_early_buyer_pct
+    if pct > limit:
+        return _fail(
+            name,
+            f"coordinated buys hold {pct:.1f}% (limit {limit:.0f}%)",
+            coordinated_pct=round(pct, 2),
+            applied=True,
+        )
+    return _ok(
+        name,
+        f"coordinated buys hold {pct:.1f}%",
+        coordinated_pct=round(pct, 2),
+        applied=True,
+    )
+
+
+def _launch_holding_readings(report: dict[str, Any]) -> float | None | str:
+    """Max launch-bundle percent from fields that actually exist. None if none do."""
+    readings: list[float] = []
+    found = False
+    supply = None
+    token = report.get("token")
+    if isinstance(token, dict):
+        supply = _num(token.get("supply"))
+    networks = report.get("insiderNetworks")
+    if isinstance(networks, list):
+        holdings: list[float] = []
+        for net in networks:
+            if not isinstance(net, dict):
+                continue
+            key = next((item for item in _LAUNCH_HOLDING_KEYS if item in net), None)
+            if key is None:
+                continue
+            found = True
+            holding = _num(net.get(key))
+            if holding is None or supply is None or supply <= 0:
+                return "bad"
+            holdings.append(holding / supply * 100.0)
+        if holdings:
+            total = sum(holdings)
+            readings.append(max(holdings) if total > 100.0 else total)
+    rows = report.get("topHolders")
+    if isinstance(rows, list):
+        flagged = False
+        total = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not any(key in row for key in _LAUNCH_ROW_FLAGS):
+                continue
+            flagged = True
+            if any(row.get(key) for key in _LAUNCH_ROW_FLAGS):
+                value = _num(row.get("pct"))
+                if value is None:
+                    return "bad"
+                total += value
+        if flagged:
+            found = True
+            readings.append(total)
+    if not found:
+        return None
+    if not readings:
+        return None
+    return max(readings)
+
+
+def _explicit_launch_bundle_pct(report: dict[str, Any]) -> float | None | str:
+    explicit: float | None = None
+    for key in _LAUNCH_PCT_KEYS:
+        if key not in report:
+            continue
+        value = _num(report.get(key))
+        if value is None:
+            return "bad"
+        explicit = value
+        break
+    derived = _launch_holding_readings(report)
+    if derived == "bad":
+        return "bad"
+    if explicit is None:
+        return derived
+    if derived is None:
+        return explicit
+    return max(explicit, float(derived))
+
+
+def _check_bundle_at_launch(rug: dict[str, Any], rules: Rules) -> Check:
+    name = "bundle_held_at_launch"
+    if not rug.get("ok"):
+        return _fail(name, f"cannot verify: {rug.get('error')}")
+    found = _explicit_launch_bundle_pct(rug["report"])
+    if found is None:
+        return _na(
+            name,
+            "no held-at-launch bundle field; current holdings were not used as a substitute",
+            applied=False,
+        )
+    if found == "bad":
+        return _fail(name, "cannot verify: held-at-launch bundle field was present but not a percentage")
+    pct = float(found)
+    if pct > rules.max_bundle_pct:
+        return _fail(
+            name,
+            f"bundle held at launch is {pct:.1f}% (limit {rules.max_bundle_pct:.0f}%)",
+            launch_bundle_pct=round(pct, 2),
+            applied=True,
+        )
+    return _ok(
+        name,
+        f"bundle held at launch is {pct:.1f}%",
+        launch_bundle_pct=round(pct, 2),
+        applied=True,
+    )
+
+
+def _check_rugcheck_onchain(rug: dict[str, Any]) -> Check:
+    name = "rugcheck_onchain"
+    if not rug.get("ok"):
+        return _fail(name, f"RugCheck/onchain fail: {rug.get('error')}")
+    report = rug["report"]
+    if report.get("rugged") is True:
+        return _fail(name, "RugCheck marks this token as rugged")
+    for key in ("status", "result"):
+        if key not in report:
+            continue
+        status = str(report.get(key) or "").strip().lower()
+        if status in _FAIL_STATUSES:
+            return _fail(name, f"RugCheck status is {status}")
+    if "risks" not in report:
+        return _na(
+            name,
+            "RugCheck report had no risk list; no extra risk was invented",
+            rugged=False,
+        )
+    risks = report.get("risks")
+    if not isinstance(risks, list):
+        return _fail(name, "cannot verify: RugCheck risks payload was not a list")
+    hard: list[str] = []
+    for risk in risks:
+        if not isinstance(risk, dict):
+            continue
+        level = str(risk.get("level") or risk.get("severity") or "").strip().lower()
+        if level in _HARD_LEVELS:
+            hard.append(str(risk.get("name") or risk.get("description") or level))
+    if hard:
+        return _fail(name, "RugCheck danger: " + ", ".join(hard))
+    return _ok(name, "RugCheck risk list has no danger-level item", risks=len(risks))
+
+
+def _best_quote_usd(rug: dict[str, Any]) -> float | None:
+    """Largest single-pool quote side. None when no market reports quoteUSD."""
+    if not rug.get("ok"):
+        return None
+    found = False
+    best = 0.0
+    for market in _markets(rug):
+        lp = market.get("lp") if isinstance(market.get("lp"), dict) else {}
+        if "quoteUSD" not in lp:
+            continue
+        found = True
+        value = _num(lp.get("quoteUSD"))
+        if value is not None:
+            best = max(best, value)
+    if not found:
+        return None
+    return best
+
+
+def _check_sell_exit_impact(market: dict[str, Any], rug: dict[str, Any], rules: Rules) -> Check:
+    name = "sell_exit_impact"
+    liquidity = market.get("liquidity")
+    if liquidity is None:
+        detail = market.get("error") or "pool liquidity in USD was missing"
+        return _fail(name, f"cannot verify: {detail}")
+    ticket = rules.position_size_usd
+    bps = slippage_bps(ticket, float(liquidity), rules)
+    reasons: list[str] = []
+    if bps > rules.max_reasonable_exit_bps:
+        reasons.append(
+            f"modeled sell slippage is {bps} bps, above {rules.max_reasonable_exit_bps} "
+            f"for a ${ticket:.0f} paper ticket"
+        )
+    quote = _best_quote_usd(rug)
+    quote_status = "NOT_APPLIED"
+    impact = None
+    if quote is None:
+        quote_status = "NOT_APPLIED"
+    elif quote <= 0:
+        reasons.append("quote-side liquidity is zero, so the paper ticket cannot be sold")
+        quote_status = "FAIL"
+    else:
+        impact = ticket / quote
+        quote_status = "PASS"
+        if impact > rules.max_sell_quote_impact:
+            reasons.append(
+                f"selling the ${ticket:.0f} paper ticket moves {impact:.1%} of quote-side liquidity "
+                f"(limit {rules.max_sell_quote_impact:.1%})"
+            )
+            quote_status = "FAIL"
+    if reasons:
+        return _fail(
+            name,
+            "; ".join(reasons),
+            slippage_bps=bps,
+            quote_impact_status=quote_status,
+            quote_impact=None if impact is None else round(impact, 4),
+        )
+    quote_note = (
+        "quote-side USD was not in the report"
+        if quote is None
+        else f"quote impact {impact:.1%} of ${quote:,.0f}"
+    )
+    return _ok(
+        name,
+        f"paper-ticket sell slippage is {bps} bps; {quote_note}. "
+        "The $50–$100 band is paper scoring only.",
+        slippage_bps=bps,
+        quote_impact_status=quote_status,
+        quote_impact=None if impact is None else round(impact, 4),
+    )
+
+
+def _check_market_cap(market: dict[str, Any], rules: Rules) -> Check:
+    name = "market_cap_band"
+    cap = market.get("market_cap")
+    if cap is None or cap <= 0:
+        detail = market.get("error") or "market cap was missing"
+        return _fail(name, f"cannot verify: {detail}")
+    low = rules.mcap_pref_min_usd
+    high = rules.mcap_pref_max_usd
+    if cap < low or cap > high:
+        return _fail(
+            name,
+            f"market cap ${cap:,.0f} is outside the ${low:,.0f}–${high:,.0f} graduated band",
+            market_cap=cap,
+        )
+    return _ok(
+        name,
+        f"market cap ${cap:,.0f} is inside the ${low:,.0f}–${high:,.0f} graduated band",
+        market_cap=cap,
+    )
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> tuple[bool, Any]:
+    for key in keys:
+        if key in mapping:
+            return True, mapping.get(key)
+    return False, None
+
+
+def _short_window_changes(pair: dict[str, Any]) -> dict[str, Any]:
+    raw = pair.get("priceChange") if isinstance(pair.get("priceChange"), dict) else {}
+    out: dict[str, Any] = {"m1": None, "m5": None, "bad": []}
+    for label, keys in (("m1", _M1_KEYS), ("m5", _M5_KEYS)):
+        present, value = _first_present(raw, keys)
+        if not present:
+            continue
+        number = _num(value)
+        if number is None:
+            out["bad"].append(label)
+        else:
+            out[label] = number
+    return out
+
+
+def _short_flow(pair: dict[str, Any], label: str) -> dict[str, Any] | None:
+    keys = _M1_KEYS if label == "m1" else _M5_KEYS
+    volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
+    txns = pair.get("txns") if isinstance(pair.get("txns"), dict) else {}
+    vol_present, vol_value = _first_present(volume, keys)
+    txn_present, txn_value = _first_present(txns, keys)
+    if not vol_present and not txn_present:
+        return None
+    buys = sells = None
+    if isinstance(txn_value, dict):
+        buys = txn_value.get("buys")
+        sells = txn_value.get("sells")
+    return {
+        "volume": _num(vol_value) if vol_present else None,
+        "buys": buys,
+        "sells": sells,
+        "volume_present": vol_present,
+        "txns_present": txn_present and isinstance(txn_value, dict),
+    }
+
+
+def _organic_flow(flow: dict[str, Any] | None, liquidity: float | None, rules: Rules) -> str:
+    """Return weak, organic, or unknown. Unknown is not a demand reading."""
+    if not flow or not flow.get("txns_present") or not flow.get("volume_present"):
+        return "unknown"
+    volume = flow.get("volume")
+    try:
+        buys = int(flow.get("buys"))
+        sells = int(flow.get("sells"))
+    except (TypeError, ValueError):
+        return "unknown"
+    if volume is None or buys < 0 or sells < 0:
+        return "unknown"
+    txns = buys + sells
+    if txns < rules.late_chase_min_prints:
+        return "weak"
+    if sells <= 0 or (buys / sells) >= rules.late_chase_max_buy_sell:
+        return "weak"
+    average = volume / txns if txns else 0.0
+    if average < rules.min_avg_trade_usd:
+        return "weak"
+    pool = liquidity or 0.0
+    turnover = (volume / pool) if pool else 99.0
+    if average < rules.wash_avg_trade_usd and turnover >= rules.wash_volume_to_liquidity:
+        return "weak"
+    return "organic"
+
+
+def _check_late_chase(market: dict[str, Any], rules: Rules) -> Check:
+    name = "late_chase"
+    bad = market.get("price_change_bad") or []
+    if bad:
+        return _fail(name, "cannot verify: " + " and ".join(bad) + " price change was present but not a number")
+    m1 = market.get("price_change_m1")
+    m5 = market.get("price_change_m5")
+    if m1 is None and m5 is None:
+        return _na(
+            name,
+            "no 1m or 5m price change was on the pair; chase and organic flow were not invented",
+            applied=False,
+        )
+    failures: list[str] = []
+    unknown = False
+    notes: list[str] = []
+    liquidity = market.get("liquidity")
+    windows = (
+        ("1m", m1, market.get("flow_m1"), rules.late_chase_m1_pct, rules.late_chase_extreme_m1_pct),
+        ("5m", m5, market.get("flow_m5"), rules.late_chase_m5_pct, rules.late_chase_extreme_m5_pct),
+    )
+    for label, change, flow, large, extreme in windows:
+        if change is None:
+            continue
+        if change >= extreme:
+            failures.append(f"{label} move is {change:.0f}%, already vertical")
+            continue
+        if change >= large:
+            quality = _organic_flow(flow if isinstance(flow, dict) else None, liquidity, rules)
+            if quality == "unknown":
+                unknown = True
+                continue
+            if quality == "weak":
+                failures.append(f"{label} move is {change:.0f}% with weak organic flow")
+            else:
+                notes.append(f"{label} {change:.0f}% still has two-sided flow")
+        else:
+            notes.append(f"{label} {change:.0f}% is not a chase")
+    evidence = {"m1": m1, "m5": m5, "applied": True}
+    if failures:
+        return _fail(name, "; ".join(failures), **evidence)
+    if unknown:
+        return _na(
+            name,
+            "short-window pump is large but organic-flow counts were missing, so no demand was assumed",
+            applied=False,
+            m1=m1,
+            m5=m5,
+        )
+    return _ok(name, "; ".join(notes) or "short-window move is not a late chase", **evidence)
+
+
+def _payload_status_fail(payload: dict[str, Any]) -> str | None:
+    if payload.get("error"):
+        return str(payload.get("error"))
+    if payload.get("ok") is False:
+        return "source reported ok=false"
+    for key in ("status", "result"):
+        if key not in payload:
+            continue
+        status = str(payload.get(key) or "").strip().lower()
+        if status in _FAIL_STATUSES:
+            return status
+    return None
+
+
+def _hard_warnings(warnings: Any) -> list[str] | None:
+    """Danger texts, or None when the warning list itself is unreadable."""
+    if not isinstance(warnings, list):
+        return None
+    hard: list[str] = []
+    for item in warnings:
+        if isinstance(item, dict):
+            level = str(item.get("level") or item.get("severity") or "").strip().lower()
+            if level in _HARD_LEVELS:
+                hard.append(str(item.get("message") or item.get("code") or item.get("name") or level))
+    return hard
+
+
+def _check_stalkchain(payload: dict[str, Any] | None, rules: Rules) -> Check:
+    name = "stalkchain_onchain"
+    source = "stalkchain"
+    if payload is None:
+        return _na(
+            name,
+            "StalkChain payload was not supplied; no holder, bundle, or demand figure was invented",
+            source=source,
+        )
+    if not isinstance(payload, dict):
+        return _fail(name, "cannot verify: StalkChain payload was not an object", source=source)
+    failed = _payload_status_fail(payload)
+    if failed:
+        return _fail(name, f"StalkChain/onchain fail: {failed}", source=source)
+    problems: list[str] = []
+    applied = False
+    for key, message in _STALK_BOOL_FAILS:
+        if key not in payload:
+            continue
+        applied = True
+        value = payload.get(key)
+        if value is False:
+            problems.append(message)
+        elif value is not True:
+            return _fail(name, f"cannot verify: StalkChain {key} was present but not a boolean", source=source)
+    for key, limit_name, label in _STALK_PCTS:
+        if key not in payload:
+            continue
+        applied = True
+        value = _num(payload.get(key))
+        if value is None:
+            return _fail(name, f"cannot verify: StalkChain {key} was present but not a percentage", source=source)
+        limit = getattr(rules, limit_name)
+        if value > limit:
+            problems.append(f"{label} {value:.1f}% (limit {limit:.0f}%)")
+    if problems:
+        return _fail(name, "StalkChain/onchain fail: " + "; ".join(problems), source=source, applied=True)
+    if not applied:
+        return _na(
+            name,
+            "StalkChain payload had no safety fields to apply; nothing was filled in",
+            source=source,
+        )
+    return _ok(name, "StalkChain safety fields that were present are inside the caps", source=source, applied=True)
+
+
+def _check_fomo(payload: dict[str, Any] | None) -> Check:
+    name = "fomo_warnings"
+    source = "fomo"
+    note = "copy and leaderboard signals do not open a buy"
+    if payload is None:
+        return _na(
+            name,
+            f"FOMO warnings were not supplied; {note}, and no demand was invented",
+            source=source,
+            auto_open=False,
+        )
+    if not isinstance(payload, dict):
+        return _fail(name, "cannot verify: FOMO payload was not an object", source=source, auto_open=False)
+    failed = _payload_status_fail(payload)
+    if failed:
+        return _fail(name, f"FOMO warning fail: {failed}", source=source, auto_open=False)
+    if "warnings" not in payload and "warning" not in payload:
+        return _na(
+            name,
+            f"FOMO payload had no warning list; {note}, and no leaderboard buy was invented",
+            source=source,
+            auto_open=False,
+            copy_signal=bool(payload.get("copy_signal")),
+        )
+    warnings = payload.get("warnings") if "warnings" in payload else payload.get("warning")
+    hard = _hard_warnings(warnings)
+    if hard is None:
+        return _fail(name, "cannot verify: FOMO warnings were present but not a list", source=source, auto_open=False)
+    if hard:
+        return _fail(
+            name,
+            "FOMO warning: " + "; ".join(hard) + f". {note}.",
+            source=source,
+            auto_open=False,
+        )
+    return _ok(
+        name,
+        f"{len(warnings)} FOMO warning(s), none marked danger. {note}.",
+        source=source,
+        auto_open=False,
+        warnings=len(warnings),
+    )
+
+
+def _check_x_intel(payload: dict[str, Any] | None) -> Check:
+    name = "x_intel"
+    source = "x"
+    if payload is None:
+        return _na(name, "X intel was not supplied; mention counts and demand were not invented", source=source)
+    if not isinstance(payload, dict):
+        return _fail(name, "cannot verify: X intel was not an object", source=source)
+    if payload.get("bot_spam") is True or payload.get("inorganic") is True:
+        return _fail(name, "X intel marked the flow as inorganic", source=source)
+    if "organic" not in payload and payload.get("bot_spam") is not False and payload.get("inorganic") is not False:
+        return _na(name, "X intel had no organic-flow flag; demand was not invented", source=source)
+    if "organic" in payload:
+        organic = payload.get("organic")
+        if organic is False:
+            return _fail(name, "X intel marked the flow as inorganic", source=source)
+        if organic is not True:
+            return _fail(name, "cannot verify: X organic flag was present but not a boolean", source=source)
+    evidence: dict[str, Any] = {}
+    if "mentions" in payload:
+        evidence["mentions"] = payload.get("mentions")
+    return _ok(name, "X intel did not flag inorganic flow", source=source, **evidence)
+
+
+def _check_padre(payload: dict[str, Any] | None, rules: Rules) -> Check:
+    name = "padre_intel"
+    source = "padre"
+    if payload is None:
+        return _na(name, "Padre intel was not supplied; no bundle or demand figure was invented", source=source)
+    if not isinstance(payload, dict):
+        return _fail(name, "cannot verify: Padre intel was not an object", source=source)
+    failed = _payload_status_fail(payload)
+    if failed:
+        return _fail(name, f"Padre intel fail: {failed}", source=source)
+    problems: list[str] = []
+    applied = False
+    for key, limit_name, label in _STALK_PCTS:
+        if key not in payload:
+            continue
+        applied = True
+        value = _num(payload.get(key))
+        if value is None:
+            return _fail(name, f"cannot verify: Padre {key} was present but not a percentage", source=source)
+        limit = getattr(rules, limit_name)
+        if value > limit:
+            problems.append(f"{label} {value:.1f}% (limit {limit:.0f}%)")
+    if "warnings" in payload:
+        applied = True
+        hard = _hard_warnings(payload.get("warnings"))
+        if hard is None:
+            return _fail(name, "cannot verify: Padre warnings were present but not a list", source=source)
+        problems.extend(hard)
+    if problems:
+        return _fail(name, "Padre intel fail: " + "; ".join(problems), source=source, applied=True)
+    if not applied:
+        return _na(name, "Padre intel had no safety fields to apply; nothing was filled in", source=source)
+    return _ok(name, "Padre fields that were present are inside the caps", source=source, applied=True)
 
 
 def _is_pump_launch(market: dict[str, Any], rug: dict[str, Any]) -> bool:
@@ -1040,7 +1755,7 @@ def _is_pump_launch(market: dict[str, Any], rug: dict[str, Any]) -> bool:
 def _check_graduation(market: dict[str, Any], rug: dict[str, Any], rules: Rules, now: datetime) -> Check:
     name = "minutes_since_graduation"
     if not _is_pump_launch(market, rug):
-        return _ok(name, "not a pump.fun launch; graduation wait not applied")
+        return _na(name, "not a pump.fun launch; graduation wait not applied")
     if market.get("bonding_curve_only"):
         return _fail(name, "still on the pump.fun bonding curve; not graduated")
     graduated = market.get("graduation_at") or market.get("pair_created")

@@ -57,6 +57,14 @@ def test_constants_match_the_edge_rules():
     assert RULES.min_minutes_since_graduation == 60
     assert RULES.max_bundle_pct == 15
     assert RULES.max_linked_early_buyer_pct == 25
+    assert RULES.mcap_pref_min_usd == 50_000
+    assert RULES.mcap_pref_max_usd == 250_000
+    assert RULES.late_chase_m5_pct == 40
+    assert RULES.late_chase_extreme_m5_pct == 80
+    assert RULES.max_reasonable_exit_bps == 300
+    assert RULES.max_reasonable_exit_bps < RULES.max_slippage_bps
+    assert RULES.max_sell_quote_impact == pytest_approx(0.015)
+    assert RULES.paper_ticket_band_applies_to_live is False
     assert RULES.flat_fee_usd == FLAT_FEE_USD == 0.95
     assert mcap_bucket(120_000) == "50-250k"
     assert mcap_bucket(49_999) == "<50k"

@@ -124,11 +124,15 @@ def render_daily(bundle: dict[str, Any], rules: Rules = RULES) -> str:
     lines.extend(["", "## Rules in force", ""])
     lines.append(
         f"Bankroll ${rules.paper_bankroll_usd:,.0f} (live-equivalent book ${rules.live_equivalent_bankroll_usd:,.0f}). "
-        f"Position ${rules.position_size_usd:,.0f} inside ${rules.position_size_min_usd:,.0f}–${rules.position_size_max_usd:,.0f}. "
+        f"Paper ticket ${rules.position_size_usd:,.0f} inside ${rules.position_size_min_usd:,.0f}–${rules.position_size_max_usd:,.0f} "
+        f"(that band is paper scoring only). "
         f"Max {rules.max_open_positions} open. Stop {rules.stop_loss_pct:.0%} with a {rules.stop_gap_extra_pct:.0%} modeled gap. "
         f"Sell half at {rules.take_profit_multiple:g}x, then trail {rules.trail_drop_from_peak:.0%} off the observed peak. "
         f"Max hold {rules.max_hold_minutes} minutes. "
         f"Paper halt ${rules.halt_equity_usd:,.0f} (live halt ${rules.live_halt_equity_usd:,.0f} on the ${rules.live_equivalent_bankroll_usd:,.0f} book). "
+        f"Graduated market cap ${rules.mcap_pref_min_usd:,.0f}–${rules.mcap_pref_max_usd:,.0f}. "
+        f"Paper-ticket sell impact at most {rules.max_reasonable_exit_bps} bps "
+        f"and {rules.max_sell_quote_impact:.1%} of quote-side liquidity. "
         f"Fee ${rules.flat_fee_usd:.2f} per fill. Copy signals do not open trades."
     )
     lines.append("")

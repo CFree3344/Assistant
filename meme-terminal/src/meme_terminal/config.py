@@ -6,13 +6,16 @@ by editing this module, not by scattering literals through the engine.
 Sizing
 -------
 The paper book stays $1,000 so a sample can absorb losers. The dedicated
-live book Chad authorized is $500. Position size stays inside the $50–$100
-band on either book; the paper book is not permission to bet more. A
-live-equivalent P&L column rescales paper results by 500/1000. The go/no-go
-rule still uses the simulated paper dollars.
+live book Chad authorized is $500. The $50–$100 band sizes paper tickets
+only. It is not a live sizing rule and this package does not place live
+orders. A live-equivalent P&L column rescales paper results by 500/1000.
+The two-week go/no-go rule still uses the simulated paper dollars.
 
 The live halt is $350, a 30% drawdown from $500. The paper engine tracks a
 $1,000 book, so its halt is the same fraction remaining: $700.
+
+Exits are unchanged: -25% stop, sell half at 1.5x, then a 25% trail off the
+observed peak, flatten at 4 hours, at most 3 open positions.
 
 This module has no network, no keypair, and no transaction code.
 """
@@ -97,10 +100,34 @@ MAX_TOP10_HOLDER_PCT = 40.0
 MAX_DEV_HOLDER_PCT = 10.0
 MAX_BUNDLE_PCT = 15.0
 # Applied only when RugCheck (or the pair payload) actually includes a
-# linked-early-buyer or sniper percentage. The public report did not carry
-# that field when this was written, and insider-network size is not used as
-# a stand-in.
+# linked-early-buyer, sniper, or coordinated-buy percentage. The public
+# report did not carry that field when this was written, and insider-network
+# size is not used as a stand-in. The same cap covers coordinated buys.
 MAX_LINKED_EARLY_BUYER_PCT = 25.0
+
+# Graduated names outside this band are skipped. Missing market cap fails
+# closed; it is not filled in.
+MCAP_PREF_MIN_USD = 50_000.0
+MCAP_PREF_MAX_USD = 250_000.0
+
+# Late chase, in percent. A 1m or 5m print at the extreme level is already
+# vertical. A print at the large level fails only when that same window's
+# flow is present and weak. A missing tape is not a flow reading.
+LATE_CHASE_M1_PCT = 25.0
+LATE_CHASE_M5_PCT = 40.0
+LATE_CHASE_EXTREME_M1_PCT = 50.0
+LATE_CHASE_EXTREME_M5_PCT = 80.0
+LATE_CHASE_MIN_PRINTS = 20
+LATE_CHASE_MAX_BUY_SELL = 4.0
+
+# Sell-side check for the paper ticket. Stricter than the 8% fill cap so a
+# pool that only clears the liquidity floor can still be too thin to exit.
+# Quote-side USD is applied only when a market actually reports it.
+MAX_REASONABLE_EXIT_BPS = 300
+MAX_SELL_QUOTE_IMPACT = 0.015
+
+# The $50–$100 band is paper scoring only. Live ticket size is not taken from it.
+PAPER_TICKET_BAND_APPLIES_TO_LIVE = False
 
 # LP must be burned, or locked at least this long by a known program.
 LP_MIN_LOCKED_PCT = 95.0
@@ -253,6 +280,17 @@ class Rules:
     max_dev_holder_pct: float = MAX_DEV_HOLDER_PCT
     max_bundle_pct: float = MAX_BUNDLE_PCT
     max_linked_early_buyer_pct: float = MAX_LINKED_EARLY_BUYER_PCT
+    mcap_pref_min_usd: float = MCAP_PREF_MIN_USD
+    mcap_pref_max_usd: float = MCAP_PREF_MAX_USD
+    late_chase_m1_pct: float = LATE_CHASE_M1_PCT
+    late_chase_m5_pct: float = LATE_CHASE_M5_PCT
+    late_chase_extreme_m1_pct: float = LATE_CHASE_EXTREME_M1_PCT
+    late_chase_extreme_m5_pct: float = LATE_CHASE_EXTREME_M5_PCT
+    late_chase_min_prints: int = LATE_CHASE_MIN_PRINTS
+    late_chase_max_buy_sell: float = LATE_CHASE_MAX_BUY_SELL
+    max_reasonable_exit_bps: int = MAX_REASONABLE_EXIT_BPS
+    max_sell_quote_impact: float = MAX_SELL_QUOTE_IMPACT
+    paper_ticket_band_applies_to_live: bool = PAPER_TICKET_BAND_APPLIES_TO_LIVE
     lp_min_locked_pct: float = LP_MIN_LOCKED_PCT
     min_lock_days: int = MIN_LOCK_DAYS
     github_recent_days: int = GITHUB_RECENT_DAYS
@@ -291,6 +329,20 @@ def _audit_rules(rules: Rules) -> None:
         raise RuntimeError("stop gap must be a fraction from 0 up to 50%")
     if rules.min_minutes_since_graduation < rules.min_age_minutes:
         raise RuntimeError("graduation wait must be at least the minimum pair age")
+    if rules.paper_ticket_band_applies_to_live:
+        raise RuntimeError("the $50–$100 ticket band is paper scoring only, not a live sizing rule")
+    if rules.mcap_pref_min_usd <= 0 or rules.mcap_pref_min_usd >= rules.mcap_pref_max_usd:
+        raise RuntimeError("graduated market-cap band is inverted")
+    if rules.late_chase_m1_pct <= 0 or rules.late_chase_m1_pct >= rules.late_chase_extreme_m1_pct:
+        raise RuntimeError("1m chase threshold must sit below the vertical threshold")
+    if rules.late_chase_m5_pct <= 0 or rules.late_chase_m5_pct >= rules.late_chase_extreme_m5_pct:
+        raise RuntimeError("5m chase threshold must sit below the vertical threshold")
+    if rules.late_chase_min_prints <= 0 or rules.late_chase_max_buy_sell <= 1:
+        raise RuntimeError("late-chase flow thresholds are not usable")
+    if rules.max_reasonable_exit_bps >= rules.max_slippage_bps:
+        raise RuntimeError("sell-exit impact gate must be stricter than the fill slippage cap")
+    if not 0 < rules.max_sell_quote_impact < 0.25:
+        raise RuntimeError("quote-side impact cap must be a fraction under 25%")
     if rules.flat_fee_usd < 0:
         raise RuntimeError("fee cannot be negative")
     if rules.live_equivalent_bankroll_usd <= 0 or rules.paper_bankroll_usd <= 0:
